@@ -33,6 +33,18 @@
         "/usr/sbin/log-viewer-history": [
           "exec"
         ],
+        "/usr/sbin/log-viewer-query": [
+          "exec"
+        ],
+        "/usr/sbin/log-viewer-ip": [
+          "exec"
+        ],
+        "/tmp/log-viewer/events.status": [
+          "read"
+        ],
+        "/tmp/log-viewer/geoip-update.status": [
+          "read"
+        ],
         "/etc/log-viewer/policies.json": [
           "read"
         ],

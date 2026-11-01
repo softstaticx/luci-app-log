@@ -1,0 +1,157 @@
+#!/bin/sh
+# Server-side firewall-history query for large persistent histories.
+# Prints a JSON page so the browser never has to load every stored line.
+set -eu
+
+RING="${LOG_VIEWER_RING:-/tmp/log-viewer/events.ring}"
+BUFFER="${LOG_VIEWER_BUFFER:-/tmp/log-viewer/persist.buffer}"
+CONFIG=log-viewer.history
+
+LIMIT=100
+OFFSET=0
+SORT=time
+ORDER=desc
+VERDICT=all
+PROTOCOL=all
+PORT=
+SOURCE=
+SEARCH=
+
+PERSIST_ENABLED=0
+PERSIST_DIR=/srv/log-viewer
+
+uci_get() { uci -q get "$1" 2>/dev/null || true; }
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | tr -d '\r'
+}
+
+load_config() {
+  PERSIST_ENABLED="${LOG_VIEWER_PERSIST:-0}"
+  PERSIST_DIR="${LOG_VIEWER_PERSIST_DIR:-/srv/log-viewer}"
+  if command -v uci >/dev/null 2>&1; then
+    [ "$(uci_get "$CONFIG.enabled")" = 1 ] && PERSIST_ENABLED=1
+    v="$(uci_get "$CONFIG.directory")"
+    [ -n "$v" ] && PERSIST_DIR="$v"
+  fi
+  if [ "${LOG_VIEWER_PERSIST_TEST:-0}" != 1 ]; then
+    case "$PERSIST_DIR" in
+      /srv/*|/srv|/mnt/*|/mnt|/media/*|/media|/etc/log-viewer/*|/etc/log-viewer|/tmp/*|/tmp) ;;
+      *) PERSIST_ENABLED=0; PERSIST_DIR=/srv/log-viewer ;;
+    esac
+  fi
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --limit) LIMIT="${2:-100}"; shift 2 ;;
+    --offset) OFFSET="${2:-0}"; shift 2 ;;
+    --sort) SORT="${2:-time}"; shift 2 ;;
+    --order) ORDER="${2:-desc}"; shift 2 ;;
+    --verdict) VERDICT="${2:-all}"; shift 2 ;;
+    --protocol) PROTOCOL="${2:-all}"; shift 2 ;;
+    --port) PORT="${2:-}"; shift 2 ;;
+    --source) SOURCE="${2:-}"; shift 2 ;;
+    --search) SEARCH="${2:-}"; shift 2 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+case "$LIMIT" in ''|*[!0-9]*) LIMIT=100 ;; esac
+[ "$LIMIT" -ge 1 ] && [ "$LIMIT" -le 500 ] || LIMIT=100
+case "$OFFSET" in ''|*[!0-9]*) OFFSET=0 ;; esac
+[ "$OFFSET" -le 1000000 ] || OFFSET=0
+case "$SORT" in time|source|port) ;; *) SORT=time ;; esac
+case "$ORDER" in asc|desc) ;; *) ORDER=desc ;; esac
+case "$VERDICT" in all|blocked|allowed|other|exposed|observed) ;; *) VERDICT=all ;; esac
+case "$PROTOCOL" in all|tcp|udp) ;; *) PROTOCOL=all ;; esac
+case "$PORT" in '') ;; *[!0-9]*) PORT= ;; esac
+case "$SOURCE" in '') ;; *[!0-9.]*) SOURCE= ;; esac
+
+load_config
+tmpdir="${LOG_VIEWER_TMP:-/tmp}/log-viewer-query.$$"
+mkdir -p "$tmpdir"
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+all="$tmpdir/all"
+filtered="$tmpdir/filtered"
+sorted="$tmpdir/sorted"
+
+{
+  if [ "$PERSIST_ENABLED" = 1 ] && [ -d "$PERSIST_DIR" ]; then
+    for file in $(ls -1 "$PERSIST_DIR"/firewall-*.log 2>/dev/null || true); do
+      [ -r "$file" ] && cat "$file"
+    done
+  fi
+  if [ -f "$BUFFER" ]; then cat "$BUFFER"; fi
+  if [ -f "$RING" ]; then cat "$RING"; fi
+} | awk 'NF && !seen[$0]++' > "$all"
+
+awk -v verdict="$VERDICT" -v protocol="$PROTOCOL" -v port="$PORT" -v source="$SOURCE" -v search="$SEARCH" '
+function value(line, key,    re, s) {
+  re = key "=[^ ]+"
+  if (match(line, re)) {
+    s = substr(line, RSTART + length(key) + 1, RLENGTH - length(key) - 1)
+    return s
+  }
+  return ""
+}
+function kind(line) {
+  if (line ~ /INFRA_PORT_OTHER:/) return "other"
+  if (line ~ /INFRA_PORT_HIT:/) return "blocked"
+  if (line ~ /(ALLOW|ACCEPT|PASS)/) return "allowed"
+  if (line ~ /(DROP|REJECT|BLOCK)/) return "blocked"
+  return "observed"
+}
+function proto(line) {
+  p = value(line, "PROTO")
+  return tolower(p)
+}
+{
+  if (verdict != "all" && kind($0) != verdict) next
+  if (protocol != "all" && proto($0) != protocol) next
+  if (port != "" && value($0, "DPT") != port) next
+  if (source != "" && value($0, "SRC") != source) next
+  if (search != "" && index(tolower($0), tolower(search)) == 0) next
+  print
+}' "$all" > "$filtered"
+
+total="$(wc -l < "$filtered" | tr -d '[:space:]')"
+case "$total" in ''|*[!0-9]*) total=0 ;; esac
+
+if [ "$SORT" = time ]; then
+  if [ "$ORDER" = desc ]; then
+    if command -v tac >/dev/null 2>&1; then tac "$filtered" > "$sorted"; else sed '1!G;h;$!d' "$filtered" > "$sorted"; fi
+  else
+    cp "$filtered" "$sorted"
+  fi
+elif [ "$SORT" = source ]; then
+  awk '{
+    s = ""; if (match($0, /SRC=[^ ]+/)) s = substr($0, RSTART + 4, RLENGTH - 4)
+    print s "\t" $0
+  }' "$filtered" | sort | cut -f2- > "$sorted"
+  if [ "$ORDER" = desc ]; then
+    if command -v tac >/dev/null 2>&1; then tac "$sorted" > "$sorted.rev"; else sed '1!G;h;$!d' "$sorted" > "$sorted.rev"; fi
+    mv "$sorted.rev" "$sorted"
+  fi
+else
+  awk '{
+    p = 0; if (match($0, /DPT=[0-9]+/)) p = substr($0, RSTART + 4, RLENGTH - 4) + 0
+    printf "%010d\t%s\n", p, $0
+  }' "$filtered" | sort -n | cut -f2- > "$sorted"
+  if [ "$ORDER" = desc ]; then
+    if command -v tac >/dev/null 2>&1; then tac "$sorted" > "$sorted.rev"; else sed '1!G;h;$!d' "$sorted" > "$sorted.rev"; fi
+    mv "$sorted.rev" "$sorted"
+  fi
+fi
+
+page="$tmpdir/page"
+awk -v offset="$OFFSET" -v limit="$LIMIT" 'NR > offset && NR <= offset + limit' "$sorted" > "$page"
+
+printf '{"total":%s,"offset":%s,"limit":%s,"sort":"%s","order":"%s","lines":[' \
+  "$total" "$OFFSET" "$LIMIT" "$SORT" "$ORDER"
+first=1
+while IFS= read -r line; do
+  if [ "$first" -eq 1 ]; then first=0; else printf ','; fi
+  printf '"%s"' "$(json_escape "$line")"
+done < "$page"
+printf ']}\n'

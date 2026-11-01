@@ -1,0 +1,20 @@
+#!/bin/sh
+# Small helper for the IP detail drawer: reverse DNS for a source address.
+set -eu
+
+case "${1:-}" in
+  reverse) ;;
+  *) echo 'usage: log-viewer-ip reverse <ipv4>' >&2; exit 2 ;;
+esac
+ip="${2:-}"
+case "$ip" in
+  ''|*[!0-9.]*|*.*.*.*.*) echo '{"error":"invalid IP"}'; exit 0 ;;
+esac
+
+name=""
+if command -v nslookup >/dev/null 2>&1; then
+  name="$(nslookup "$ip" 2>/dev/null | sed -n -e 's/^[[:space:]]*[Nn]ame:[[:space:]]*//p' -e 's/^.*[Nn]ame[[:space:]]*=[[:space:]]*//p' | head -n 1)"
+fi
+[ -n "$name" ] || name=""
+name="$(printf '%s' "$name" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n' | sed 's/\.$//')"
+printf '{"ip":"%s","name":"%s"}\n' "$ip" "$name"

@@ -27,3 +27,11 @@ test('GeoIP database refresh is granted as its own command', () => {
   assert.ok(Object.keys(grant.write.file).includes('/usr/bin/flint4-geoip-update'));
   assert.deepEqual(grant.write.file['/usr/bin/flint4-geoip-update'], ['exec']);
 });
+
+test('server history, reverse DNS, and update status paths are readable', () => {
+  const readPaths = Object.keys(grant.read.file);
+  assert.ok(readPaths.includes('/usr/sbin/log-viewer-query'));
+  assert.ok(readPaths.includes('/usr/sbin/log-viewer-ip'));
+  assert.ok(readPaths.includes('/tmp/log-viewer/events.status'));
+  assert.ok(readPaths.includes('/tmp/log-viewer/geoip-update.status'));
+});

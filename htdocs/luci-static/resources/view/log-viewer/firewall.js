@@ -164,6 +164,13 @@ function csvCell(value) {
   return '"' + text.replace(/"/g, '""') + '"';
 }
 
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+  if (bytes >= 1024) return Math.round(bytes / 1024) + ' KB';
+  return bytes + ' B';
+}
+
 function isPublic(ip) {
   if (!ip || ip === '-' || ip === '0.0.0.0') return false;
   if (ip.indexOf(':') >= 0) return false;
@@ -294,6 +301,25 @@ function downloadBlob(filename, blob) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    return navigator.clipboard.writeText(String(text));
+  return new Promise(function(resolve, reject) {
+    const area = document.createElement('textarea');
+    area.value = String(text);
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    try {
+      document.execCommand('copy') ? resolve() : reject(new Error('copy failed'));
+    }
+    catch (e) { reject(e); }
+    finally { area.remove(); }
+  });
+}
+
 const callLogRead = rpc.declare({
   object: 'log',
   method: 'read',
@@ -355,6 +381,9 @@ return view.extend({
   timeFilter: 'all',
   sourceFilter: '',
   portFilter: null,
+  countryFilter: '',
+  asnFilter: '',
+  sortBy: 'time-desc',
   paused: false,
   policyRules: [],
   policyRulesLoaded: false,
@@ -588,6 +617,10 @@ return view.extend({
     this.kind.value = this.kindFilter = preset.kind;
     this.proto.value = this.protoFilter = preset.proto;
     this.window.value = this.timeFilter = preset.window;
+    this.sourceFilter = '';
+    this.countryFilter = '';
+    this.asnFilter = '';
+    this.portFilter = null;
     this.maxEntries = PAGE_SIZE;
     this.renderRows();
     this.renderInsightsPanel();
@@ -862,6 +895,200 @@ return view.extend({
     return {interfaces, ports};
   },
 
+  openHistorySettings: async function() {
+    let status = {};
+    try { status = parseWatchConfig(await fs.exec_direct('/usr/sbin/log-viewer-history', ['status'], 'text')) || {}; }
+    catch (e) {}
+    const enabled = E('input', {type: 'checkbox'});
+    enabled.checked = status.persist_enabled === 1;
+    const directory = E('input', {class: 'cbi-input-text', type: 'text', value: status.persist_directory || '/srv/log-viewer'});
+    const days = E('input', {class: 'cbi-input-text', type: 'number', min: 1, max: 3650, value: String(status.persist_days || 7)});
+    const maxMb = E('input', {class: 'cbi-input-text', type: 'number', min: 1, max: 8192, value: String(status.persist_max_mb || 32)});
+    const error = E('p', {class: 'fw-modal-error', hidden: true, role: 'alert'});
+    const save = E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: async () => {
+      error.hidden = true;
+      save.disabled = true;
+      try {
+        const raw = await fs.exec_direct('/usr/sbin/log-viewer-history', [
+          'configure', enabled.checked ? '1' : '0', directory.value.trim(), days.value, maxMb.value
+        ], 'text');
+        this.routerHistoryStatus = parseWatchConfig(raw);
+        this.routerHistorySyncedAt = Date.now();
+        if (this.routerHistoryText && this.routerHistoryStatus) {
+          const count = this.routerHistoryStatus.count != null ? this.routerHistoryStatus.count : '—';
+          const cap = this.routerHistoryStatus.cap || 500;
+          this.routerHistoryText.textContent = _('Router memory: ') + count + _(' of ') + cap +
+            _(' firewall lines') + (this.routerHistoryStatus.persist_enabled === 1
+              ? _(' · disk history on, ') + (this.routerHistoryStatus.persist_files || 0) + _(' files')
+              : _(' · disk history off'));
+        }
+        ui.hideModal();
+        ui.addNotification(null, E('p', _('Persistent history settings saved.')), 'info');
+      }
+      catch (e) {
+        save.disabled = false;
+        error.textContent = _('Could not save history settings: ') + (e.message || e);
+        error.hidden = false;
+      }
+    }}, _('Save history settings'));
+    ui.showModal(_('Persistent history settings'), [
+      E('p', {class: 'cbi-section-descr'}, _('Opt in to writing new firewall lines to daily files on a mounted disk or USB path. The router memory ring always stays available. Use a mounted disk rather than internal flash to avoid unnecessary writes.')),
+      E('label', {class: 'fw-settings-field fw-watch-toggle'}, [enabled, E('span', {}, _('Enable persistent disk history'))]),
+      E('div', {class: 'fw-watch-grid'}, [
+        E('label', {class: 'fw-settings-field'}, [
+          E('span', {}, _('Directory')),
+          directory,
+          E('small', {}, _('Must be under /srv, /mnt, /media, /etc/log-viewer or /tmp.'))
+        ]),
+        E('label', {class: 'fw-settings-field'}, [
+          E('span', {}, _('Retention (days)')),
+          days,
+          E('small', {}, _('Older daily files are pruned automatically.'))
+        ])
+      ]),
+      E('label', {class: 'fw-settings-field'}, [
+        E('span', {}, _('Maximum size (MB)')),
+        maxMb,
+        E('small', {}, _('Oldest daily files are removed when the directory grows past this limit.'))
+      ]),
+      error,
+      E('div', {class: 'fw-modal-actions'}, [
+        E('button', {class: 'cbi-button', type: 'button', click: ui.hideModal}, _('Cancel')),
+        save
+      ])
+    ], 'fw-modal', 'fw-history-settings-modal');
+  },
+
+  openServerHistory: async function() {
+    let status = null;
+    try { status = parseWatchConfig(await fs.exec_direct('/usr/sbin/log-viewer-history', ['status'], 'text')); }
+    catch (e) {}
+    const state = {
+      offset: 0, limit: 100, total: 0, events: [], sort: 'time', order: 'desc',
+      verdict: 'all', protocol: 'all', port: '', source: '', search: ''
+    };
+    const search = E('input', {class: 'cbi-input-text', type: 'search', placeholder: _('Search stored lines…'), 'aria-label': _('Search router history')});
+    const verdict = E('select', {class: 'cbi-input-select', 'aria-label': _('Filter stored events by verdict')}, [
+      E('option', {value: 'all'}, _('All verdicts')),
+      E('option', {value: 'blocked'}, _('Blocked')),
+      E('option', {value: 'other'}, _('Other')),
+      E('option', {value: 'allowed'}, _('Allowed'))
+    ]);
+    const protocol = E('select', {class: 'cbi-input-select', 'aria-label': _('Filter stored events by protocol')}, [
+      E('option', {value: 'all'}, _('All protocols')),
+      E('option', {value: 'tcp'}, 'TCP'),
+      E('option', {value: 'udp'}, 'UDP')
+    ]);
+    const port = E('input', {class: 'cbi-input-text', type: 'number', min: 1, max: 65535, placeholder: _('Port'), 'aria-label': _('Filter stored events by port')});
+    const sort = E('select', {class: 'cbi-input-select', 'aria-label': _('Sort stored events')}, [
+      E('option', {value: 'time'}, _('Time')),
+      E('option', {value: 'source'}, _('Source')),
+      E('option', {value: 'port'}, _('Port'))
+    ]);
+    const order = E('select', {class: 'cbi-input-select', 'aria-label': _('Sort direction')}, [
+      E('option', {value: 'desc'}, _('Descending')),
+      E('option', {value: 'asc'}, _('Ascending'))
+    ]);
+    const tbody = E('tbody');
+    const table = E('table', {class: 'table fw-table fw-history-table'}, [
+      E('thead', {}, E('tr', {class: 'tr table-titles'},
+        ['Time', 'Source / GeoIP', 'Destination', 'Port / Protocol', 'Verdict', 'Packet', 'Details']
+          .map(title => E('th', {class: 'th'}, _(title))))),
+      tbody
+    ]);
+    const counter = E('span', {class: 'fw-muted'});
+    const error = E('p', {class: 'fw-modal-error', hidden: true, role: 'alert'});
+    const eventById = new Map();
+    let searchTimer;
+    const prev = E('button', {class: 'cbi-button', type: 'button', disabled: true, click: () => {
+      state.offset = Math.max(0, state.offset - state.limit);
+      load();
+    }}, _('Previous'));
+    const next = E('button', {class: 'cbi-button', type: 'button', disabled: true, click: () => {
+      state.offset += state.limit;
+      load();
+    }}, _('Next'));
+    const load = async () => {
+      error.hidden = true;
+      const args = ['--limit', String(state.limit), '--offset', String(state.offset),
+        '--sort', state.sort, '--order', state.order, '--verdict', state.verdict,
+        '--protocol', state.protocol];
+      if (state.port) args.push('--port', state.port);
+      if (state.source) args.push('--source', state.source);
+      if (state.search) args.push('--search', state.search);
+      try {
+        const raw = await fs.exec_direct('/usr/sbin/log-viewer-query', args, 'text');
+        const data = JSON.parse(raw || '{}');
+        state.total = Number(data.total) || 0;
+        state.events = (Array.isArray(data.lines) ? data.lines : [])
+          .map((line, index) => parseLine(line, index + 1, this.watchConfig && this.watchConfig.router_offset))
+          .filter(Boolean);
+        eventById.clear();
+        state.events.forEach(event => eventById.set(String(event.id), event));
+        const render = () => {
+          tbody.innerHTML = state.events.map(event => this.renderEventRow(event)).join('') ||
+            '<tr><td colspan="7" class="center">No stored events match these filters.</td></tr>';
+        };
+        render();
+        counter.textContent = state.total
+          ? _('Showing ') + (state.offset + 1) + '–' + Math.min(state.offset + state.events.length, state.total) +
+            _(' of ') + state.total
+          : _('No stored events match these filters.');
+        prev.disabled = state.offset <= 0;
+        next.disabled = state.offset + state.limit >= state.total;
+        this.enrich(state.events).then(() => { if (tbody.isConnected) render(); }).catch(() => {});
+      }
+      catch (e) {
+        error.textContent = _('Could not read router history: ') + (e.message || e);
+        error.hidden = false;
+        tbody.innerHTML = '';
+      }
+    };
+    const reload = () => { state.offset = 0; load(); };
+    search.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => { state.search = search.value.trim(); reload(); }, 150);
+    });
+    verdict.addEventListener('change', () => { state.verdict = verdict.value; reload(); });
+    protocol.addEventListener('change', () => { state.protocol = protocol.value; reload(); });
+    port.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => { state.port = port.value.trim(); reload(); }, 150);
+    });
+    sort.addEventListener('change', () => { state.sort = sort.value; reload(); });
+    order.addEventListener('change', () => { state.order = order.value; reload(); });
+    tbody.addEventListener('click', ev => {
+      const sourceLink = ev.target.closest('.fw-source-link');
+      if (sourceLink) {
+        this.openIpDrawer(sourceLink.getAttribute('data-source') || '', state.events);
+        return;
+      }
+      const detailButton = ev.target.closest('.fw-event-details');
+      if (detailButton) {
+        const event = eventById.get(detailButton.getAttribute('data-id'));
+        if (event) this.showEventDetails(event);
+      }
+    });
+    const persistent = status && status.persist_enabled === 1;
+    ui.showModal(_('Router history'), [
+      E('p', {class: 'cbi-section-descr'}, _('Reads the router ring and opt-in disk history in pages. Filtering and sorting happen on the router, so large histories do not have to fit in the browser.')),
+      E('p', {class: 'fw-help'}, persistent
+        ? _('Disk history enabled · ') + (status.persist_files || 0) + _(' files · ') + (status.persist_kb || 0) + ' KB'
+        : _('Disk history is off; this searches the router memory ring only.')),
+      E('div', {class: 'fw-history-controls'}, [search, verdict, protocol, port, sort, order]),
+      E('div', {class: 'fw-tablewrap fw-history-tablewrap'}, table),
+      E('div', {class: 'fw-history-pager'}, [
+        counter,
+        E('div', {class: 'fw-history-pager-buttons'}, [prev, next])
+      ]),
+      error,
+      E('div', {class: 'fw-modal-actions'}, [
+        E('button', {class: 'cbi-button', type: 'button', click: ui.hideModal}, _('Close'))
+      ])
+    ], 'fw-modal', 'fw-history-modal');
+    load();
+  },
+
   openTrafficSettings: async function() {
     await this.loadWatchConfig(true);
     const config = this.watchConfig;
@@ -1041,18 +1268,58 @@ return view.extend({
   updateGeoDatabases: async function() {
     if (this.geoUpdateButton) this.geoUpdateButton.disabled = true;
     if (this.geoStatusText) this.geoStatusText.textContent = _('Updating GeoIP databases…');
+    const stateLine = E('p', {class: 'fw-geo-state'}, _('Starting GeoIP update…'));
+    const detail = E('pre', {class: 'fw-raw-log fw-geo-log'}, '');
+    const error = E('p', {class: 'fw-modal-error', hidden: true, role: 'alert'});
+    const close = E('button', {class: 'cbi-button', type: 'button', click: () => {
+      if (poll) clearInterval(poll);
+      ui.hideModal();
+    }}, _('Close'));
+    let poll = null;
+    const updateStatus = async () => {
+      try {
+        const raw = await fs.read('/tmp/log-viewer/geoip-update.status');
+        const status = parseWatchConfig(raw);
+        if (!status) return;
+        stateLine.textContent = status.message || status.state || '';
+        const sizes = [];
+        if (status.country_bytes) sizes.push(_('Country ') + formatBytes(status.country_bytes));
+        if (status.asn_bytes) sizes.push(_('ASN ') + formatBytes(status.asn_bytes));
+        if (sizes.length) detail.textContent = sizes.join(' · ');
+        if (status.state === 'done' || status.state === 'error') {
+          clearInterval(poll);
+          poll = null;
+          close.disabled = false;
+        }
+      }
+      catch (e) {}
+    };
+    ui.showModal(_('Update GeoIP databases'), [
+      E('p', {class: 'cbi-section-descr'}, _('Downloads the GeoLite2 Country and ASN databases from GitHub, validates both with mmdblookup, then replaces the local copies. This can take a minute on a slow link.')),
+      stateLine,
+      detail,
+      error,
+      E('div', {class: 'fw-modal-actions'}, [close])
+    ], 'fw-modal', 'fw-geo-modal');
+    await updateStatus();
+    poll = setInterval(updateStatus, 1000);
     try {
       const output = await fs.exec_direct('/usr/bin/flint4-geoip-update', [], 'text', false, true);
       await this.loadGeoStatus();
       this.renderGeoStatus();
-      ui.addNotification(null, E('p', String(output || '').trim() || _('GeoLite2 Country and ASN databases updated.')), 'info');
+      stateLine.textContent = _('Applied. Databases are ready.');
+      detail.textContent = String(output || '').trim() || detail.textContent;
     }
     catch (e) {
-      ui.addNotification(null, E('p', _('GeoIP databases were not updated: ') + (e.message || e)), 'error');
+      error.textContent = _('GeoIP databases were not updated: ') + (e.message || e);
+      error.hidden = false;
+      await updateStatus();
       try { await this.loadGeoStatus(); this.renderGeoStatus(); }
       catch (statusError) {}
     }
     finally {
+      if (poll) clearInterval(poll);
+      close.disabled = false;
       if (this.geoUpdateButton) this.geoUpdateButton.disabled = false;
     }
   },
@@ -1256,8 +1523,8 @@ return view.extend({
   readRouterRing: async function() {
     if (!watchConfigIsFresh(this.routerHistorySyncedAt, Date.now(), 20000)) {
       try {
-        const raw = await fs.exec_direct('/usr/sbin/log-viewer-history', ['update'], 'text');
-        this.routerHistoryStatus = JSON.parse(raw || '{}');
+        const raw = await fs.exec_direct('/usr/sbin/log-viewer-history', ['status'], 'text');
+        this.routerHistoryStatus = parseWatchConfig(raw);
       }
       catch (e) {
         this.routerHistoryStatus = null;
@@ -1269,12 +1536,30 @@ return view.extend({
   },
 
   clearRouterHistory: async function() {
+    const status = this.routerHistoryStatus;
+    if (status && status.persist_enabled === 1) {
+      ui.showModal(_('Clear router history?'), [
+        E('p', {}, _('This deletes the router memory ring and every persistent history file in ') + (status.persist_directory || _('the configured directory')) + '.'),
+        E('div', {class: 'fw-modal-actions'}, [
+          E('button', {class: 'cbi-button', type: 'button', click: ui.hideModal}, _('Cancel')),
+          E('button', {class: 'cbi-button cbi-button-negative important', type: 'button', click: () => {
+            this.clearRouterHistoryNow().catch(e => ui.addNotification(null, E('p', e.message), 'error'));
+          }}, _('Clear everything'))
+        ])
+      ], 'fw-modal');
+      return;
+    }
+    await this.clearRouterHistoryNow();
+  },
+
+  clearRouterHistoryNow: async function() {
     const raw = await fs.exec_direct('/usr/sbin/log-viewer-history', ['clear'], 'text');
-    this.routerHistoryStatus = JSON.parse(raw || '{}');
+    this.routerHistoryStatus = parseWatchConfig(raw);
     this.routerHistorySyncedAt = Date.now();
     this.lastRingData = null;
     if (this.routerHistoryText)
-      this.routerHistoryText.textContent = _('Router history cleared. New firewall lines are collected on the next check.');
+      this.routerHistoryText.textContent = _('Router history cleared.');
+    ui.hideModal();
     this.refreshEvents().catch(() => {});
   },
 
@@ -1354,9 +1639,13 @@ return view.extend({
     if (this.historyRetention === 'off')
       this.historyStatusText.textContent = _('Browser history is off. Shown events are the live log plus router memory.');
     if (this.routerHistoryText) {
-      const count = this.routerHistoryStatus && this.routerHistoryStatus.count != null ? this.routerHistoryStatus.count : '—';
-      const cap = this.routerHistoryStatus && this.routerHistoryStatus.cap ? this.routerHistoryStatus.cap : 500;
-      this.routerHistoryText.textContent = _('Router memory: ') + count + _(' of ') + cap + _(' firewall lines · cleared on reboot');
+      const status = this.routerHistoryStatus;
+      const count = status && status.count != null ? status.count : '—';
+      const cap = status && status.cap ? status.cap : 500;
+      const disk = status && status.persist_enabled === 1
+        ? _(' · disk history on, ') + (status.persist_files || 0) + _(' files, ') + (status.persist_kb || 0) + ' KB'
+        : _(' · disk history off');
+      this.routerHistoryText.textContent = _('Router memory: ') + count + _(' of ') + cap + _(' firewall lines · cleared on reboot') + disk;
     }
     this.statusText.textContent = this.paused
       ? _('Auto-refresh paused · manually refreshed at ') + (new Date()).toLocaleTimeString()
@@ -1420,9 +1709,32 @@ return view.extend({
       return (this.kindFilter === 'all' || e.kind.toLowerCase() === this.kindFilter) &&
         (this.protoFilter === 'all' || e.protocol.toLowerCase() === this.protoFilter) &&
         (!this.sourceFilter || e.source === this.sourceFilter) &&
+        (!this.countryFilter || String(geo.country_code || '').toUpperCase() === this.countryFilter) &&
+        (!this.asnFilter || String(geo.asn_organization || '') === this.asnFilter) &&
         (this.portFilter == null || Number(e.dport) === Number(this.portFilter)) &&
         searchable.includes(query);
     });
+  },
+
+  sortEvents: function(events) {
+    const sorted = events.slice();
+    const ascending = this.sortBy.endsWith('-asc');
+    const direction = ascending ? 1 : -1;
+    const text = value => String(value || '').toLowerCase();
+    if (this.sortBy.startsWith('time')) {
+      sorted.sort((a, b) => direction * ((a.timestampMs || 0) - (b.timestampMs || 0)));
+    }
+    else if (this.sortBy === 'source-asc') {
+      sorted.sort((a, b) => text(a.source).localeCompare(text(b.source)) || ((b.timestampMs || 0) - (a.timestampMs || 0)));
+    }
+    else if (this.sortBy === 'country-asc') {
+      const country = event => text((this.geoCache[event.source] || {}).country_name || '~');
+      sorted.sort((a, b) => country(a).localeCompare(country(b)) || text(a.source).localeCompare(text(b.source)));
+    }
+    else if (this.sortBy === 'port-asc') {
+      sorted.sort((a, b) => Number(a.dport || 0) - Number(b.dport || 0) || ((b.timestampMs || 0) - (a.timestampMs || 0)));
+    }
+    return sorted;
   },
 
   renderEventRow: function(e) {
@@ -1436,7 +1748,7 @@ return view.extend({
     return '<tr class="tr fw-' + kindClass + '" data-event-id="' + esc(e.id) + '">' +
       '<td class="td fw-time">' + esc(e.timestamp) + '</td>' +
       '<td class="td fw-source"><span class="fw-flag" title="' + esc(country) + '">' + countryFlag(countryCode) + '</span> ' +
-        '<code>' + esc(e.source) + '</code>' +
+        '<button type="button" class="fw-source-link" data-source="' + esc(e.source) + '" title="' + esc(_('Open source details')) + '"><code>' + esc(e.source) + '</code></button>' +
         '<small>' + esc(country) + (asn ? ' · ' + esc(asn) : '') + '</small></td>' +
       '<td class="td"><code>' + esc(e.destination || '—') + '</code></td>' +
       '<td class="td fw-port"><strong>' + esc(e.dport || '—') + '</strong><small>' + esc(e.service) + ' · ' + esc(e.protocol) + '</small></td>' +
@@ -1466,7 +1778,7 @@ return view.extend({
   renderRows: function() {
     if (!this.tbody) return;
     const windowed = this.getWindowedEvents();
-    const matching = this.getMatchingEvents(windowed);
+    const matching = this.sortEvents(this.getMatchingEvents(windowed));
     this.filteredEvents = matching;
     const events = matching.slice(0, this.maxEntries);
     this.eventById = new Map(events.map(event => [String(event.id), event]));
@@ -1498,6 +1810,61 @@ return view.extend({
     }
     this.loadMoreButton.hidden = events.length >= matching.length;
     this.loadMoreButton.textContent = _('Show ') + PAGE_SIZE + _(' more events · ') + (matching.length - events.length) + _(' remaining');
+    this.renderChips(windowed);
+  },
+
+  renderChips: function(events) {
+    if (!this.chips) return;
+    const countries = new Map();
+    const asns = new Map();
+    const ports = new Map();
+    const verdicts = new Map();
+    events.forEach(event => {
+      const geo = this.geoCache[event.source] || {};
+      const code = String(geo.country_code || '').toUpperCase();
+      if (/^[A-Z]{2}$/.test(code)) {
+        if (!countries.has(code)) countries.set(code, {code, name: geo.country_name || code, count: 0});
+        countries.get(code).count++;
+      }
+      const asn = String(geo.asn_organization || '');
+      if (asn) {
+        if (!asns.has(asn)) asns.set(asn, {name: asn, count: 0});
+        asns.get(asn).count++;
+      }
+      if (event.dport) {
+        const port = Number(event.dport);
+        if (port > 0) {
+          if (!ports.has(port)) ports.set(port, {port, service: event.service || '', count: 0});
+          ports.get(port).count++;
+        }
+      }
+      verdicts.set(event.kind, (verdicts.get(event.kind) || 0) + 1);
+    });
+    const top = (map, limit) => [...map.values()].sort((a, b) => b.count - a.count).slice(0, limit);
+    const chip = (label, active, attrs) => E('button', Object.assign({
+      type: 'button',
+      class: 'fw-chip' + (active ? ' active' : '')
+    }, attrs), label);
+    const items = [];
+    ['Blocked', 'Other', 'Exposed', 'Allowed', 'Observed'].forEach(kind => {
+      const count = verdicts.get(kind) || 0;
+      if (count) items.push(chip(kind + ' ' + count, this.kindFilter === kind.toLowerCase(), {
+        'data-chip': 'kind', 'data-value': kind.toLowerCase()
+      }));
+    });
+    top(countries, 4).forEach(item => items.push(chip(item.code + ' ' + item.count, this.countryFilter === item.code, {
+      'data-chip': 'country', 'data-value': item.code, title: item.name
+    })));
+    top(asns, 3).forEach(item => items.push(chip(item.name + ' ' + item.count, this.asnFilter === item.name, {
+      'data-chip': 'asn', 'data-value': item.name
+    })));
+    top(ports, 4).forEach(item => items.push(chip(':' + item.port + ' ' + item.count, this.portFilter === item.port, {
+      'data-chip': 'port', 'data-value': String(item.port), title: item.service
+    })));
+    if (this.kindFilter !== 'all' || this.countryFilter || this.asnFilter || this.portFilter != null || this.sourceFilter)
+      items.push(chip(_('Clear filters'), false, {'data-chip': 'clear'}));
+    this.chips.replaceChildren(...items);
+    this.chips.hidden = !items.length;
   },
 
   render: function() {
@@ -1587,6 +1954,51 @@ return view.extend({
       .fw-modal .fw-modal-error { margin: 10px 0 0; padding: 8px 10px; color: #FFD6E7; background: #4A2431; border: 1px solid #8B3E57; border-radius: 7px; font-size: 12px; line-height: 1.5; }
       .fw-modal .fw-help { margin: 4px 0 0; color: var(--mp-muted); font-size: 12px; line-height: 1.5; }
       .fw-details-modal { width: min(680px, 94vw); }
+      .fw-drawer-modal { position: fixed; top: 0; right: 0; left: auto; width: min(480px, 96vw); height: 100vh; max-height: 100vh; margin: 0; border-radius: 0; transform: none; }
+      .fw-drawer-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 10px 0 4px; }
+      .fw-drawer-summary > div { padding: 8px 10px; background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 7px; }
+      .fw-drawer-summary strong { display: block; color: var(--mp-fg); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
+      .fw-drawer-summary span { color: var(--mp-muted); font-size: 11px; }
+      .fw-drawer-meta { margin-top: 10px; }
+      .fw-drawer-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+      .fw-drawer-events { display: grid; gap: 6px; }
+      .fw-drawer-event { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; width: 100%; padding: 7px 9px; color: var(--mp-fg); background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 7px; font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+      .fw-drawer-event:hover { border-color: var(--mp-cyan); }
+      .fw-drawer-event-time { color: var(--mp-muted); font-size: 11px; }
+      .fw-modal .fw-muted { color: var(--mp-muted); font-size: 12px; }
+      .fw-modal .fw-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+      .fw-modal .fw-chip { padding: 4px 9px; color: var(--mp-fg); background: var(--mp-surface); border: 1px solid var(--mp-border); border-radius: 999px; font-size: 12px; font-weight: 650; cursor: pointer; }
+      .fw-modal .fw-chip:hover { border-color: var(--mp-cyan); }
+      .fw-modal .fw-chip.active { color: var(--mp-bg); background: var(--mp-cyan); border-color: var(--mp-cyan); }
+      .fw-modal .fw-badge { display: inline-block; padding: 2px 6px; border: 1px solid transparent; border-radius: 4px; font-size: 11px; font-weight: 800; line-height: 1.35; white-space: nowrap; }
+      .fw-modal .fw-badge.blocked { color: #2D2A2E; background: var(--mp-pink); }
+      .fw-modal .fw-badge.other { color: #2D2A2E; background: var(--mp-orange); }
+      .fw-modal .fw-badge.observed { color: #2D2A2E; background: var(--mp-yellow); }
+      .fw-modal .fw-badge.allowed { color: #22251E; background: var(--mp-green); }
+      .fw-modal .fw-badge.exposed { color: #20232D; background: var(--mp-cyan); }
+      .fw-modal .fw-tablewrap { overflow: auto; border: 1px solid var(--mp-border); border-radius: 8px; }
+      .fw-modal .fw-table { width: 100%; min-width: 900px; border-collapse: separate; border-spacing: 0; background: var(--mp-bg); color: var(--mp-fg); font-size: 12px; }
+      .fw-modal .fw-table th { position: sticky; top: 0; z-index: 1; padding: 8px; color: var(--mp-fg); background: var(--mp-panel); border-bottom: 1px solid var(--mp-border); font-size: 11px; text-align: left; }
+      .fw-modal .fw-table td { padding: 7px 8px; color: var(--mp-fg); border-bottom: 1px solid var(--mp-border); vertical-align: top; }
+      .fw-modal .fw-table tbody tr:nth-child(even) { background: var(--mp-panel); }
+      .fw-modal .fw-table small { display: block; color: var(--mp-muted); font-size: 11px; font-weight: 400; }
+      .fw-modal .fw-source-link { padding: 0; color: inherit; background: none; border: 0; font: inherit; text-align: left; cursor: pointer; }
+      .fw-modal .fw-source-link code { color: var(--mp-fg); background: var(--mp-surface); border: 1px solid var(--mp-border); border-radius: 4px; padding: 1px 4px; font-size: 11px; }
+      .fw-modal .fw-source-link:hover code { border-color: var(--mp-cyan); }
+      .fw-history-modal { width: min(1180px, 96vw); }
+      .fw-history-settings-modal { width: min(680px, 94vw); }
+      .fw-geo-modal { width: min(640px, 94vw); }
+      .fw-geo-state { margin: 10px 0 8px; color: var(--mp-fg); font-size: 13px; font-weight: 700; }
+      .fw-geo-log { min-height: 40px; max-height: 180px; margin: 0; }
+      .fw-history-controls { display: grid; grid-template-columns: minmax(160px, 2fr) repeat(3, minmax(110px, 1fr)) repeat(2, minmax(90px, 0.8fr)); gap: 8px; margin: 10px 0; }
+      .fw-history-controls input,
+      .fw-history-controls select { width: 100%; min-height: 36px; }
+      .fw-history-tablewrap { max-height: 52vh; }
+      .fw-history-pager { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: center; margin-top: 10px; }
+      .fw-history-pager-buttons { display: flex; gap: 8px; }
+      @media (max-width: 800px) {
+        .fw-history-controls { grid-template-columns: 1fr 1fr; }
+      }
       .fw-details-modal .fw-event-meta { margin-top: 4px; }
       .fw-details-modal h3 { margin: 16px 0 6px; font-size: 13px; }
       .fw-details-modal .fw-raw-log { margin: 0; padding: 10px; color: var(--mp-fg); background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 7px; }
@@ -1787,6 +2199,9 @@ return view.extend({
         font-size: 12px !important;
         font-weight: 700;
       }
+      .fw-shell .fw-source-link { padding: 0; color: inherit; background: none; border: 0; font: inherit; text-align: left; cursor: pointer; }
+      .fw-shell .fw-source-link:hover code,
+      .fw-shell .fw-source-link:focus-visible code { border-color: var(--mp-cyan); }
       .fw-shell .fw-signal {
         padding: 3px 7px !important;
         color: #FFE8B3 !important;
@@ -1959,6 +2374,11 @@ return view.extend({
       .fw-shell .fw-file-import { min-height: 36px !important; padding: 7px 12px !important; font-size: 13px !important; }
       .fw-shell .fw-results-meta { display: flex; flex-wrap: wrap; gap: 5px 16px; margin: 8px 0 12px; color: var(--mp-muted); font-size: 13px !important; line-height: 1.5; }
       .fw-shell .fw-results-meta .right { color: var(--mp-fg) !important; font-size: 13px !important; }
+      .fw-shell .fw-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 10px; }
+      .fw-shell .fw-chips[hidden] { display: none !important; }
+      .fw-shell .fw-chip { padding: 4px 9px; color: var(--mp-fg); background: var(--mp-surface); border: 1px solid var(--mp-border); border-radius: 999px; font-size: 12px; font-weight: 650; cursor: pointer; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .fw-shell .fw-chip:hover { border-color: var(--mp-cyan); }
+      .fw-shell .fw-chip.active { color: var(--mp-bg); background: var(--mp-cyan); border-color: var(--mp-cyan); }
       .fw-shell .fw-more-actions { margin: 12px 0; border: 1px solid var(--mp-border); border-radius: 8px; background: var(--mp-panel); }
       .fw-shell .fw-more-actions > summary { padding: 10px 12px; cursor: pointer; font-size: 13px; font-weight: 750; }
       .fw-shell .fw-more-content { display: grid; gap: 0; padding: 0 14px 8px; }
@@ -2024,6 +2444,15 @@ return view.extend({
       E('option', {value: '24h'}, _('Last 24 hours'))
     ]);
     this.presets = E('select', {class: 'cbi-input-select', title: _('Apply a filter you saved in this browser'), 'aria-label': _('Saved filter presets')});
+    this.sort = E('select', {class: 'cbi-input-select', title: _('Sort the event table'), 'aria-label': _('Sort events')}, [
+      E('option', {value: 'time-desc'}, _('Newest first')),
+      E('option', {value: 'time-asc'}, _('Oldest first')),
+      E('option', {value: 'source-asc'}, _('Source A–Z')),
+      E('option', {value: 'country-asc'}, _('Country A–Z')),
+      E('option', {value: 'port-asc'}, _('Destination port'))
+    ]);
+    this.chips = E('div', {class: 'fw-chips', 'aria-label': _('Quick filters')});
+    this.sort.value = this.sortBy;
     this.renderPresetOptions();
     this.counter = E('span', {class: 'right'});
     this.statusText = E('span', {class: 'fw-muted'});
@@ -2076,6 +2505,8 @@ return view.extend({
     this.insightClear = E('button', {class: 'cbi-button fw-insight-clear', hidden: true, click: () => {
       this.sourceFilter = '';
       this.portFilter = null;
+      this.countryFilter = '';
+      this.asnFilter = '';
       this.timelineRange = null;
       this.maxEntries = PAGE_SIZE;
       this.renderRows();
@@ -2108,9 +2539,11 @@ return view.extend({
         ]),
         E('section', {class: 'fw-settings-section fw-settings-history'}, [
           E('h3', {}, _('History')),
-          E('p', {class: 'fw-muted'}, _('Browser history stays on this computer, up to 10,000 events. Router history is a memory ring of firewall lines on this router. It is cleared on reboot, and it keeps those lines when other syslog would push them out of the live buffer.')),
+          E('p', {class: 'fw-muted'}, _('Browser history stays on this computer, up to 10,000 events. Router history is a memory ring of firewall lines on this router, cleared on reboot. Persistent disk history is opt-in and writes daily files to a mounted path.')),
           E('div', {class: 'fw-settings-actions'}, [
             E('label', {class: 'fw-history-control'}, [E('span', {}, _('This browser')), this.historyRetentionSelect]),
+            E('button', {class: 'cbi-button cbi-button-action', type: 'button', click: () => this.openServerHistory()}, _('Browse router history')),
+            E('button', {class: 'cbi-button', type: 'button', click: () => this.openHistorySettings()}, _('Persistent history settings')),
             E('button', {class: 'cbi-button', click: () => this.clearLocalHistory().catch(e => ui.addNotification(null, E('p', e.message), 'error'))}, _('Clear browser history')),
             E('button', {class: 'cbi-button', click: () => this.clearRouterHistory().catch(e => ui.addNotification(null, E('p', e.message), 'error'))}, _('Clear router history'))
           ]),
@@ -2142,7 +2575,7 @@ return view.extend({
       E('p', {class: 'cbi-section-descr fw-description'}, _('Each row is one firewall event. A known-port probe is Blocked when nothing allows or forwards it. Other is a low-rate sample of a port outside that list. Allowed requires an explicit ALLOW/ACCEPT log. GeoIP lookups stay local.')),
       this.stats,
       E('div', {class: 'fw-toolbar fw-primary-toolbar'}, [
-        this.search, this.kind, this.proto, this.window,
+        this.search, this.kind, this.proto, this.window, this.sort,
         this.presets,
         E('button', {class: 'cbi-button', click: () => this.saveFilterPreset()}, _('Save filter')),
         this.deletePresetButton,
@@ -2150,6 +2583,7 @@ return view.extend({
         this.pauseButton,
         E('button', {class: 'cbi-button cbi-button-action fw-export-button', click: () => this.exportCSV(false)}, _('Export filtered CSV'))
       ]),
+      this.chips,
       E('div', {class: 'fw-results-meta'}, [this.counter, this.statusText, this.insightClear]),
       this.insightsDisclosure,
       E('div', {class: 'fw-tablewrap'}, table),
@@ -2158,6 +2592,11 @@ return view.extend({
     ]);
 
     this.tbody.addEventListener('click', ev => {
+      const sourceLink = ev.target.closest('.fw-source-link');
+      if (sourceLink) {
+        this.openIpDrawer(sourceLink.getAttribute('data-source') || '');
+        return;
+      }
       const detailButton = ev.target.closest('.fw-event-details');
       if (detailButton) {
         const event = (this.eventById && this.eventById.get(detailButton.getAttribute('data-id'))) ||
@@ -2187,10 +2626,14 @@ return view.extend({
       if (portButton) {
         this.portFilter = Number(portButton.getAttribute('data-port-filter'));
         this.sourceFilter = '';
+        this.countryFilter = '';
+        this.asnFilter = '';
       }
       else if (sourceButton) {
         this.sourceFilter = sourceButton.getAttribute('data-source-filter') || '';
         this.portFilter = null;
+        this.countryFilter = '';
+        this.asnFilter = '';
       }
       else {
         const allPorts = ev.target.closest('.fw-show-all-ports');
@@ -2216,6 +2659,31 @@ return view.extend({
     });
     this.kind.addEventListener('change', () => { this.kindFilter = this.kind.value; this.maxEntries = PAGE_SIZE; this.renderRows(); });
     this.proto.addEventListener('change', () => { this.protoFilter = this.proto.value; this.maxEntries = PAGE_SIZE; this.renderRows(); });
+    this.sort.addEventListener('change', () => { this.sortBy = this.sort.value; this.maxEntries = PAGE_SIZE; this.renderRows(); });
+    this.chips.addEventListener('click', ev => {
+      const chip = ev.target.closest('.fw-chip');
+      if (!chip) return;
+      const type = chip.getAttribute('data-chip');
+      const value = chip.getAttribute('data-value') || '';
+      if (type === 'kind')
+        this.kindFilter = this.kindFilter === value ? 'all' : value;
+      else if (type === 'country')
+        this.countryFilter = this.countryFilter === value ? '' : value;
+      else if (type === 'asn')
+        this.asnFilter = this.asnFilter === value ? '' : value;
+      else if (type === 'port')
+        this.portFilter = this.portFilter === Number(value) ? null : Number(value);
+      else if (type === 'clear') {
+        this.kindFilter = 'all';
+        this.countryFilter = '';
+        this.asnFilter = '';
+        this.portFilter = null;
+        this.sourceFilter = '';
+      }
+      this.kind.value = this.kindFilter;
+      this.maxEntries = PAGE_SIZE;
+      this.renderRows();
+    });
     this.window.addEventListener('change', () => {
       this.timeFilter = this.window.value;
       this.timelineRange = null;
@@ -2273,6 +2741,92 @@ return view.extend({
       E('pre', {class: 'fw-raw-log'}, event.rawLine || ''),
       E('div', {class: 'fw-modal-actions'}, buttons)
     ], 'fw-modal', 'fw-details-modal');
+  },
+
+  openIpDrawer: function(ip, sourceEvents) {
+    ip = String(ip || '').trim();
+    if (!ip) return;
+    const events = (sourceEvents || this.events).filter(event => event.source === ip)
+      .sort((a, b) => (b.timestampMs || 0) - (a.timestampMs || 0));
+    const geo = this.geoCache[ip] || {};
+    const portCounts = new Map();
+    const verdicts = new Map();
+    events.forEach(event => {
+      const port = Number(event.dport);
+      if (port > 0) portCounts.set(port, (portCounts.get(port) || 0) + 1);
+      verdicts.set(event.kind, (verdicts.get(event.kind) || 0) + 1);
+    });
+    const first = events.length ? events[events.length - 1] : null;
+    const last = events.length ? events[0] : null;
+    const ptr = E('dd', {class: 'fw-drawer-ptr'}, _('Resolving…'));
+    const kindClass = event => event.kind === 'Blocked' ? 'blocked' :
+      (event.kind === 'Allowed' ? 'allowed' : (event.kind === 'Exposed' ? 'exposed' :
+      (event.kind === 'Other' ? 'other' : 'observed')));
+    const portButtons = [...portCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([port, count]) => E('button', {class: 'fw-chip', type: 'button', click: () => {
+        this.addWatchPort(Number(port)).catch(e => ui.addNotification(null, E('p', e.message || e), 'error'));
+      }}, ':' + port + ' · ' + count));
+    const recent = events.slice(0, 12).map(event => E('button', {
+      class: 'fw-drawer-event', type: 'button', click: () => this.showEventDetails(event)
+    }, [
+      E('span', {class: 'fw-drawer-event-time'}, event.timestamp),
+      E('span', {}, ':' + (event.dport || '—') + ' · ' + event.protocol),
+      E('span', {class: 'fw-badge ' + kindClass(event)}, event.kind)
+    ]));
+    const content = [
+      E('div', {class: 'fw-drawer-summary'}, [
+        E('div', {}, [E('strong', {}, String(events.length)), E('span', {}, _(' events in this view'))]),
+        E('div', {}, [E('strong', {}, String(portCounts.size)), E('span', {}, _(' ports'))]),
+        E('div', {}, [E('strong', {}, first ? first.timestamp : '—'), E('span', {}, _(' first seen'))]),
+        E('div', {}, [E('strong', {}, last ? last.timestamp : '—'), E('span', {}, _(' last seen'))])
+      ]),
+      E('dl', {class: 'fw-event-meta fw-drawer-meta'}, [
+        E('dt', {}, _('Country')), E('dd', {}, geo.country_name || _('GeoIP unavailable')),
+        E('dt', {}, _('ASN')), E('dd', {}, geo.asn_organization || '—'),
+        E('dt', {}, _('Reverse DNS')), ptr,
+        E('dt', {}, _('Verdicts')), E('dd', {},
+          [...verdicts.entries()].map(item => item[0] + ' ' + item[1]).join(' · ') || '—')
+      ]),
+      E('div', {class: 'fw-drawer-actions'}, [
+        E('button', {class: 'cbi-button', type: 'button', click: () => {
+          copyToClipboard(ip)
+            .then(() => ui.addNotification(null, E('p', _('Source IP copied.')), 'info'))
+            .catch(() => ui.addNotification(null, E('p', _('Could not copy the source IP.')), 'error'));
+        }}, _('Copy IP')),
+        E('button', {class: 'cbi-button', type: 'button', disabled: !last, click: () => {
+          copyToClipboard(last ? last.rawLine : '')
+            .then(() => ui.addNotification(null, E('p', _('Log line copied.')), 'info'))
+            .catch(() => ui.addNotification(null, E('p', _('Could not copy the log line.')), 'error'));
+        }}, _('Copy latest log line')),
+        E('button', {class: 'cbi-button', type: 'button', click: () => {
+          this.sourceFilter = ip;
+          this.countryFilter = '';
+          this.asnFilter = '';
+          this.portFilter = null;
+          this.maxEntries = PAGE_SIZE;
+          ui.hideModal();
+          this.renderRows();
+          this.insightsDisclosure.open = false;
+        }}, _('Filter live table to this IP'))
+      ]),
+      E('h5', {class: 'fw-section-heading'}, _('Ports and watch actions')),
+      E('div', {class: 'fw-chips'}, portButtons.length ? portButtons : [E('span', {class: 'fw-muted'}, _('No ports in this view.'))]),
+      E('h5', {class: 'fw-section-heading'}, _('Recent events')),
+      E('div', {class: 'fw-drawer-events'}, recent.length ? recent : [E('p', {class: 'fw-muted'}, _('No events in the current loaded view.'))]),
+      E('div', {class: 'fw-modal-actions'}, [
+        E('button', {class: 'cbi-button', type: 'button', click: ui.hideModal}, _('Close'))
+      ])
+    ];
+    ui.showModal(_('Source ') + ip, content, 'fw-modal', 'fw-drawer-modal');
+    fs.exec_direct('/usr/sbin/log-viewer-ip', ['reverse', ip], 'text')
+      .then(raw => {
+        let data = {};
+        try { data = JSON.parse(raw || '{}'); } catch (e) {}
+        ptr.textContent = data.name || _('No PTR record');
+      })
+      .catch(() => { ptr.textContent = _('Reverse DNS unavailable'); });
   },
 
   exportCSV: function(allLoaded) {

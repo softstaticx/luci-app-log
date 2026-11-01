@@ -9,6 +9,20 @@ const shell = process.platform === 'win32' ? path.join(gitUsr, 'sh.exe') : 'sh';
 const cygpath = path.join(gitUsr, 'cygpath.exe');
 const shellAvailable = process.platform !== 'win32' || fs.existsSync(shell) && fs.existsSync(cygpath);
 
+test('GeoIP updater exposes progress and the page polls it', () => {
+  const updater = fs.readFileSync(path.join(__dirname, '../root/usr/bin/flint4-geoip-update'), 'utf8');
+  const view = fs.readFileSync(path.join(__dirname, '../htdocs/luci-static/resources/view/log-viewer/firewall.js'), 'utf8');
+  const acl = JSON.parse(fs.readFileSync(path.join(__dirname, '../root/usr/share/rpcd/acl.d/luci-app-log-viewer.json'), 'utf8'));
+  assert.match(updater, /set_status/);
+  assert.match(updater, /--status/);
+  assert.match(updater, /set_status validating/);
+  assert.match(updater, /set_status applying/);
+  assert.match(updater, /set_status done/);
+  assert.match(view, /geoip-update\.status/);
+  assert.match(view, /fs\.exec_direct\('\/usr\/bin\/flint4-geoip-update'/);
+  assert.ok(Object.keys(acl['luci-app-log-viewer'].read.file).includes('/tmp/log-viewer/geoip-update.status'));
+});
+
 test('GeoIP status reports missing, current, and stale database pairs', {skip: !shellAvailable}, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reffix-geoip-status-'));
   const db = path.join(root, 'db');

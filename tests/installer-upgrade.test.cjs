@@ -39,7 +39,7 @@ test('an older install is upgraded in place', () => {
   }
 });
 
-test('the same release is replaced when the installer runs again', () => {
+test('the same release is replaced when force-reinstall is unavailable', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reffix-upgrade-'));
   try {
     const result = runPlan(root, [
@@ -51,8 +51,26 @@ test('the same release is replaced when the installer runs again', () => {
     assert.match(result.log, /del libmaxminddb/);
     const delApp = result.log.indexOf('del luci-app-log-viewer');
     const delLib = result.log.indexOf('del libmaxminddb');
-    const add = result.log.indexOf('add --allow-untrusted --upgrade');
+    const add = result.log.indexOf('add --allow-untrusted /tmp/lib.apk');
     assert.ok(delApp < delLib && delLib < add);
+  }
+  finally {
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('the same release is reinstalled without deleting dependencies when supported', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reffix-upgrade-'));
+  try {
+    const result = runPlan(root, [
+      ['libmaxminddb', '1.0.0-r1'],
+      ['luci-app-log-viewer', '3.3.1-r1']
+    ], '1.0.0-r1', '3.3.1-r1', {forceReinstall: true});
+    assert.match(result.out, /Reinstalling luci-app-log-viewer 3\.3\.1-r1/);
+    assert.match(result.out, /Reinstalling libmaxminddb 1\.0\.0-r1/);
+    assert.match(result.log, /add --allow-untrusted --force-reinstall \/tmp\/lib\.apk \/tmp\/app\.apk/);
+    assert.equal(result.log.includes(' del '), false);
+    assert.equal(result.log.includes('--upgrade'), false);
   }
   finally {
     fs.rmSync(root, {recursive: true, force: true});
@@ -129,7 +147,7 @@ test('an unreadable package fails before apk add or del', () => {
     assert.throws(
       () => runPlan(root, [], '1.13.3-r1', '3.3.1-r1', {adbdumpFail: true, tarFail: true}),
       err => {
-        assert.match(String(err.stderr), /couldn't read the package version/);
+        assert.match(String(err.stderr || err.message || err), /couldn't read the package version/);
         return true;
       }
     );
@@ -147,6 +165,7 @@ function runPlan(root, installed, libVer, appVer, opts = {}) {
   const db = path.join(root, 'installed');
   const adbdumpFail = opts.adbdumpFail ? 1 : 0;
   const tarFail = opts.tarFail ? 1 : 0;
+  const forceReinstall = opts.forceReinstall ? 1 : 0;
   const tarLibVer = opts.tar ? libVer : '0.0.0-bad';
   const tarAppVer = opts.tar ? appVer : '0.0.0-bad';
   fs.writeFileSync(db, installed.map(row => row.join(' ')).join('\n') + (installed.length ? '\n' : ''));
@@ -203,6 +222,7 @@ tar() {
 }
 `;
   const out = execFileSync('sh', ['-c', `set -eu
+APK_FORCE_REINSTALL=${forceReinstall}
 ${fake}
 ${match[0]}
 install_downloaded_packages /tmp/lib.apk /tmp/app.apk`], {

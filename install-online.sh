@@ -3,7 +3,7 @@
 set -eu
 
 REPO=REFFIX-X/luci-app-log
-VERSION_FALLBACK=v3.3.3
+VERSION_FALLBACK=v3.3.4
 FAMILY=25.12
 EXT=apk
 TMP="/tmp/reffix-luci-install.$$"
@@ -94,15 +94,24 @@ install_downloaded_packages() {
   app_act="$PKG_ACT"
   app_old="$PKG_OLD"
   app_new="$PKG_NEW"
-  if [ "$app_act" = same ]; then app_act=replace; fi
+  if [ "$app_act" = same ]; then
+    if [ "$APK_FORCE_REINSTALL" = 1 ]; then app_act=reinstall; else app_act=replace; fi
+  fi
   if [ "$lib_act" = same ]; then
-    if [ "$app_act" = replace ]; then lib_act=replace; else lib_act=keep; fi
+    case "$app_act" in
+      reinstall|replace)
+        if [ "$APK_FORCE_REINSTALL" = 1 ]; then lib_act=reinstall; else lib_act=replace; fi
+        ;;
+      *) lib_act=keep ;;
+    esac
   fi
   # A failed version comparison must not delete the library out from under a newer app.
   if [ "$app_act" = keep ] && [ "$lib_act" = replace ]; then lib_act=keep; fi
+  if [ "$app_act" = keep ] && [ "$lib_act" = reinstall ]; then lib_act=keep; fi
   case "$lib_act" in
     install) echo "Installing libmaxminddb $lib_new." ;;
     upgrade) echo "Upgrading libmaxminddb from $lib_old to $lib_new." ;;
+    reinstall) echo "Reinstalling libmaxminddb $lib_new." ;;
     replace) echo "Replacing installed libmaxminddb $lib_old." ;;
     keep)
       if [ -n "$lib_old" ] && [ "$lib_old" != "$lib_new" ]; then
@@ -113,26 +122,32 @@ install_downloaded_packages() {
   case "$app_act" in
     install) echo "Installing luci-app-log-viewer $app_new." ;;
     upgrade) echo "Upgrading luci-app-log-viewer from $app_old to $app_new." ;;
+    reinstall) echo "Reinstalling luci-app-log-viewer $app_new." ;;
     replace) echo "Replacing installed luci-app-log-viewer $app_old." ;;
     keep) echo "Installed luci-app-log-viewer $app_old is newer than $app_new; leaving it." ;;
   esac
   if [ "$lib_act" = keep ] && [ "$app_act" = keep ]; then
     return 0
   fi
-  if [ "$lib_act" = replace ] && [ "$app_act" != keep ] && [ "$app_act" != install ]; then
-    apk del luci-app-log-viewer
-  elif [ "$app_act" = replace ]; then
+  if [ "$app_act" = replace ]; then
     apk del luci-app-log-viewer
   fi
   if [ "$lib_act" = replace ]; then
     apk del libmaxminddb
   fi
+  reinstall_flag=""
+  case "$lib_act:$app_act" in
+    *reinstall*) reinstall_flag=--force-reinstall ;;
+  esac
+  upgrade_flag=""
+  case "$lib_act" in install|upgrade) upgrade_flag=--upgrade ;; esac
+  case "$app_act" in install|upgrade) upgrade_flag=--upgrade ;; esac
   if [ "$lib_act" != keep ] && [ "$app_act" != keep ]; then
-    apk add --allow-untrusted --upgrade "$lib" "$app"
+    apk add --allow-untrusted $reinstall_flag $upgrade_flag "$lib" "$app"
   elif [ "$lib_act" != keep ]; then
-    apk add --allow-untrusted --upgrade "$lib"
+    apk add --allow-untrusted $reinstall_flag $upgrade_flag "$lib"
   elif [ "$app_act" != keep ]; then
-    apk add --allow-untrusted --upgrade "$app"
+    apk add --allow-untrusted $reinstall_flag $upgrade_flag "$app"
   fi
 }
 
@@ -140,6 +155,10 @@ command -v apk >/dev/null 2>&1 || {
   echo "ERROR: REFFIX Firewall Log requires APK on OpenWrt 25.12 or a supported MediaTek Filogic snapshot. IPK/opkg releases are no longer built." >&2
   exit 1
 }
+APK_FORCE_REINSTALL=0
+if apk add --help 2>&1 | grep -q -- '--force-reinstall'; then
+  APK_FORCE_REINSTALL=1
+fi
 if [ -r /etc/openwrt_release ]; then . /etc/openwrt_release; fi
 case "${DISTRIB_RELEASE:-}:${DISTRIB_TARGET:-}" in
   25.12*:*) ;;

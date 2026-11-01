@@ -1,29 +1,108 @@
 #!/bin/sh
 # Keep a tmpfs ring of firewall log lines so other syslog cannot evict them.
+# The follow mode streams logread instead of rescanning the last 1500 lines.
+# Optional persistent history appends new firewall lines to daily files.
 set -eu
 
 RING="${LOG_VIEWER_RING:-/tmp/log-viewer/events.ring}"
 CAP="${LOG_VIEWER_RING_CAP:-500}"
-case "$CAP" in ''|*[!0-9]*) CAP=500 ;; esac
+STATUS_FILE="${LOG_VIEWER_STATUS:-/tmp/log-viewer/events.status}"
+BUFFER="${LOG_VIEWER_BUFFER:-/tmp/log-viewer/persist.buffer}"
+CONFIG=log-viewer.history
 
-status() {
+PERSIST_ENABLED=0
+PERSIST_DIR=/srv/log-viewer
+PERSIST_DAYS=7
+PERSIST_MAX_MB=32
+PERSIST_FILE=
+PERSIST_TICK=0
+
+case "$CAP" in ''|*[!0-9]*) CAP=500 ;; esac
+[ "$CAP" -ge 1 ] || CAP=500
+
+uci_get() { uci -q get "$1" 2>/dev/null || true; }
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'
+}
+
+load_config() {
+  PERSIST_ENABLED="${LOG_VIEWER_PERSIST:-0}"
+  PERSIST_DIR="${LOG_VIEWER_PERSIST_DIR:-/srv/log-viewer}"
+  PERSIST_DAYS="${LOG_VIEWER_PERSIST_DAYS:-7}"
+  PERSIST_MAX_MB="${LOG_VIEWER_PERSIST_MAX_MB:-32}"
+  if command -v uci >/dev/null 2>&1; then
+    v="$(uci_get "$CONFIG.enabled")"
+    [ "$v" = 1 ] && PERSIST_ENABLED=1
+    v="$(uci_get "$CONFIG.directory")"
+    [ -n "$v" ] && PERSIST_DIR="$v"
+    v="$(uci_get "$CONFIG.days")"
+    case "$v" in ''|*[!0-9]*) ;; *) PERSIST_DAYS=$v ;; esac
+    v="$(uci_get "$CONFIG.max_mb")"
+    case "$v" in ''|*[!0-9]*) ;; *) PERSIST_MAX_MB=$v ;; esac
+  fi
+  if [ "${LOG_VIEWER_PERSIST_TEST:-0}" != 1 ]; then
+    case "$PERSIST_DIR" in
+      /srv/*|/srv|/mnt/*|/mnt|/media/*|/media|/etc/log-viewer/*|/etc/log-viewer|/tmp/*|/tmp) ;;
+      *) PERSIST_ENABLED=0; PERSIST_DIR=/srv/log-viewer ;;
+    esac
+  fi
+  case "$PERSIST_DAYS" in ''|*[!0-9]*) PERSIST_DAYS=7 ;; esac
+  case "$PERSIST_MAX_MB" in ''|*[!0-9]*) PERSIST_MAX_MB=32 ;; esac
+  [ "$PERSIST_DAYS" -le 3650 ] || PERSIST_DAYS=3650
+  [ "$PERSIST_MAX_MB" -le 8192 ] || PERSIST_MAX_MB=8192
+}
+
+persist_stats() {
+  files=0
+  kb=0
+  if [ "$PERSIST_ENABLED" = 1 ] && [ -d "$PERSIST_DIR" ]; then
+    files="$(find "$PERSIST_DIR" -type f -name 'firewall-*.log' 2>/dev/null | wc -l | tr -d '[:space:]')"
+    kb="$(du -sk "$PERSIST_DIR" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]')"
+    case "$files" in ''|*[!0-9]*) files=0 ;; esac
+    case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+  fi
+}
+
+status_json() {
   count=0
   if [ -f "$RING" ]; then
     count="$(wc -l < "$RING" | tr -d '[:space:]')"
     case "$count" in ''|*[!0-9]*) count=0 ;; esac
   fi
-  printf '{"count":%s,"cap":%s,"storage":"tmpfs"}\n' "$count" "$CAP"
+  persist_stats
+  storage=tmpfs
+  [ "$PERSIST_ENABLED" = 1 ] && storage=tmpfs+disk
+  printf '{"count":%s,"cap":%s,"storage":"%s","persist_enabled":%s,"persist_directory":"%s","persist_days":%s,"persist_max_mb":%s,"persist_files":%s,"persist_kb":%s}\n' \
+    "$count" "$CAP" "$storage" "$PERSIST_ENABLED" "$(json_escape "$PERSIST_DIR")" \
+    "$PERSIST_DAYS" "$PERSIST_MAX_MB" "$files" "$kb"
 }
+
+write_status() {
+  mkdir -p "$(dirname "$STATUS_FILE")"
+  status_json > "$STATUS_FILE.tmp" 2>/dev/null || true
+  mv "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
+}
+
+status() { flush_persist; status_json; }
 
 is_firewall_line() {
   line="$1"
-  if printf '%s' "$line" | grep -Eq 'INFRA_PORT_(HIT|OTHER):'; then
-    return 0
-  fi
-  printf '%s' "$line" | grep -q 'SRC=' || return 1
-  printf '%s' "$line" | grep -Eq 'DPT=[0-9]+' || return 1
-  printf '%s' "$line" | grep -Eq 'DROP|REJECT|BLOCK|ALLOW|ACCEPT|PASS' || return 1
-  return 0
+  case "$line" in
+    *INFRA_PORT_HIT:*|*INFRA_PORT_OTHER:*) return 0 ;;
+  esac
+  case "$line" in
+    *SRC=*) ;;
+    *) return 1 ;;
+  esac
+  case "$line" in
+    *DPT=[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$line" in
+    *DROP*|*REJECT*|*BLOCK*|*ALLOW*|*ACCEPT*|*PASS*) return 0 ;;
+  esac
+  return 1
 }
 
 read_log() {
@@ -40,40 +119,180 @@ read_log() {
   return 0
 }
 
-update() {
-  mkdir -p "$(dirname "$RING")"
-  merged="$(mktemp)"
-  next="$(mktemp)"
-  if [ -f "$RING" ]; then
-    cat "$RING" >> "$merged"
+follow_log() {
+  if command -v logread >/dev/null 2>&1; then
+    logread -f 2>/dev/null || true
+    return 0
   fi
+  for bin in /sbin/logread /usr/sbin/logread /usr/libexec/logread-ubox; do
+    if [ -x "$bin" ]; then
+      "$bin" -f 2>/dev/null || true
+      return 0
+    fi
+  done
+  return 0
+}
+
+refresh_persist_file() {
+  [ "$PERSIST_ENABLED" = 1 ] || return 0
+  mkdir -p "$PERSIST_DIR"
+  PERSIST_FILE="$PERSIST_DIR/firewall-$(date +%Y-%m-%d).log"
+}
+
+prune_persist() {
+  [ "$PERSIST_ENABLED" = 1 ] || return 0
+  [ -d "$PERSIST_DIR" ] || return 0
+  if [ "$PERSIST_DAYS" -gt 0 ]; then
+    find "$PERSIST_DIR" -type f -name 'firewall-*.log' -mtime +"$PERSIST_DAYS" -delete 2>/dev/null || true
+  fi
+  max_kb=$((PERSIST_MAX_MB * 1024))
+  [ "$max_kb" -gt 0 ] || return 0
+  while :; do
+    kb="$(du -sk "$PERSIST_DIR" 2>/dev/null | awk '{print $1}')"
+    case "$kb" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$kb" -le "$max_kb" ] && break
+    oldest="$(ls -1tr "$PERSIST_DIR"/firewall-*.log 2>/dev/null | head -n 1 || true)"
+    [ -n "$oldest" ] || break
+    rm -f "$oldest"
+  done
+}
+
+flush_persist() {
+  [ "$PERSIST_ENABLED" = 1 ] || return 0
+  [ -s "$BUFFER" ] || return 0
+  refresh_persist_file
+  cat "$BUFFER" >> "$PERSIST_FILE"
+  : > "$BUFFER"
+  prune_persist
+}
+
+append_persist() {
+  [ "$PERSIST_ENABLED" = 1 ] || return 0
+  mkdir -p "$(dirname "$BUFFER")"
+  printf '%s\n' "$1" >> "$BUFFER"
+  PERSIST_TICK=$((PERSIST_TICK + 1))
+  if [ $((PERSIST_TICK % 200)) -eq 0 ]; then
+    flush_persist
+  fi
+}
+
+trim_ring() {
+  mkdir -p "$(dirname "$RING")"
+  [ -f "$RING" ] || : > "$RING"
+  next="${RING}.tmp.$$"
+  awk 'NF && !seen[$0]++' "$RING" | tail -n "$CAP" > "$next"
+  mv "$next" "$RING"
+  flush_persist
+  write_status
+}
+
+seed() {
+  mkdir -p "$(dirname "$RING")"
+  [ -f "$RING" ] || : > "$RING"
   read_log | while IFS= read -r line; do
     if is_firewall_line "$line"; then
-      printf '%s\n' "$line"
+      printf '%s\n' "$line" >> "$RING"
+      append_persist "$line"
     fi
-  done >> "$merged"
-  awk 'NF && !seen[$0]++' "$merged" | tail -n "$CAP" > "$next"
-  mv "$next" "$RING"
-  rm -f "$merged"
+  done
+  flush_persist
+  trim_ring
+}
+
+update() {
+  seed
   status
 }
 
-clear_ring() {
-  rm -f "$RING"
+clear_all() {
+  rm -f "$RING" "$BUFFER"
+  if [ -d "$PERSIST_DIR" ]; then
+    find "$PERSIST_DIR" -type f -name 'firewall-*.log' -delete 2>/dev/null || true
+  fi
+  write_status
   status
 }
 
 follow() {
+  load_config
+  refresh_persist_file
+  seed
+  failures=0
   while true; do
-    update >/dev/null || true
-    sleep 15
+    started="$(date +%s)"
+    follow_log | {
+      count=0
+      while IFS= read -r line; do
+        is_firewall_line "$line" || continue
+        printf '%s\n' "$line" >> "$RING"
+        append_persist "$line"
+        count=$((count + 1))
+        if [ "$count" -ge 25 ]; then
+          trim_ring
+          count=0
+        fi
+      done
+    }
+    flush_persist
+    trim_ring
+    elapsed=$(( $(date +%s) - started ))
+    if [ "$elapsed" -lt 5 ]; then
+      failures=$((failures + 1))
+    else
+      failures=0
+    fi
+    if [ "$failures" -ge 2 ]; then
+      # Older logread without follow support: fall back to a timed snapshot.
+      update >/dev/null 2>&1 || true
+      failures=0
+      sleep 15
+    else
+      sleep 2
+    fi
   done
 }
+
+configure() {
+  enabled="${1:-0}"
+  directory="${2:-/srv/log-viewer}"
+  days="${3:-7}"
+  max_mb="${4:-32}"
+  case "$enabled" in 0|1) ;; *) echo 'enabled must be 0 or 1' >&2; exit 2 ;; esac
+  case "$directory" in
+    /srv/*|/mnt/*|/media/*|/etc/log-viewer/*|/tmp/*) ;;
+    *) echo 'directory must be under /srv, /mnt, /media, /etc/log-viewer or /tmp' >&2; exit 2 ;;
+  esac
+  case "$directory" in *[!a-zA-Z0-9_./-]*) echo 'invalid directory' >&2; exit 2 ;; esac
+  case "$days" in ''|*[!0-9]*) echo 'days must be a number' >&2; exit 2 ;; esac
+  case "$max_mb" in ''|*[!0-9]*) echo 'max_mb must be a number' >&2; exit 2 ;; esac
+  [ "$days" -ge 1 ] && [ "$days" -le 3650 ] || { echo 'days must be 1..3650' >&2; exit 2; }
+  [ "$max_mb" -ge 1 ] && [ "$max_mb" -le 8192 ] || { echo 'max_mb must be 1..8192' >&2; exit 2; }
+  if [ "$enabled" = 1 ]; then
+    mkdir -p "$directory" || { echo 'cannot create history directory' >&2; exit 1; }
+    : > "$directory/.write-test" 2>/dev/null || { echo 'history directory is not writable' >&2; exit 1; }
+    rm -f "$directory/.write-test"
+  fi
+  uci set log-viewer.history=history 2>/dev/null || true
+  uci set "log-viewer.history.enabled=$enabled"
+  uci set "log-viewer.history.directory=$directory"
+  uci set "log-viewer.history.days=$days"
+  uci set "log-viewer.history.max_mb=$max_mb"
+  uci commit log-viewer
+  /etc/init.d/log-viewer-history restart >/dev/null 2>&1 || true
+  load_config
+  status
+}
+
+load_config
 
 case "${1:-}" in
   update) update ;;
   status) status ;;
-  clear) clear_ring ;;
+  clear) clear_all ;;
   follow) follow ;;
-  *) echo 'usage: log-viewer-history {update|status|clear|follow}' >&2; exit 2 ;;
+  configure)
+    shift
+    configure "$@"
+    ;;
+  *) echo 'usage: log-viewer-history {update|status|clear|follow|configure <0|1> <dir> <days> <max_mb>}' >&2; exit 2 ;;
 esac

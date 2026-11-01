@@ -125,9 +125,23 @@ test('missing default ports are appended and GeoIP can be refreshed from setting
   assert.match(source, /\/usr\/bin\/flint4-geoip-update/);
 });
 
+test('server history, sorting, chips and the source drawer are wired', () => {
+  assert.match(source, /openServerHistory/);
+  assert.match(source, /log-viewer-query/);
+  assert.match(source, /log-viewer-history', \[\s*'configure'/);
+  assert.match(source, /openIpDrawer/);
+  assert.match(source, /log-viewer-ip/);
+  assert.match(source, /fw-source-link/);
+  assert.match(source, /sortEvents/);
+  assert.match(source, /fw-chips/);
+  assert.match(source, /renderChips/);
+  assert.match(source, /geoip-update\.status/);
+  assert.match(source, /formatBytes/);
+});
+
 test('modals use the LuCI 25.12 showModal signature and keep actions in content', () => {
-  assert.equal((source.match(/ui\.showModal\(/g) || []).length, 4);
-  assert.equal((source.match(/\n\s*\], 'fw-modal', 'fw-[^']+'\);/g) || []).length, 4);
+  assert.equal((source.match(/ui\.showModal\(/g) || []).length, 9);
+  assert.equal((source.match(/'fw-modal'/g) || []).length, 9);
   assert.match(source, /fw-modal-actions/);
   assert.match(source, /fw-watch-grid/);
   assert.match(source, /fw-watch-status/);

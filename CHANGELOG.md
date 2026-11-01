@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.3.4 (2026-11-01)
+
+- Click a source IP to open a detail drawer with all events in view, ports, first/last seen, reverse DNS, copy IP/log line, and one-click port-watch actions.
+- Sort the table by time, source, country, or destination port, and filter with quick chips for verdict, country, ASN, and port.
+- Add **Browse router history**, a server-side query dialog with filtering, sorting, and pagination, plus an opt-in persistent history store on disk or USB.
+- Replace the 15-second full `logread -l 1500` rescan with a `logread -f` stream, incremental ring updates, and optional batched daily history files.
+- Show GeoIP download, validation, and apply progress in a dialog and refresh the database age when it completes.
+- Reinstall same-version packages with `apk add --force-reinstall` when supported, avoiding `apk del` removing auto-installed dependencies.
+
 ## v3.3.3 (2026-11-01)
 
 - Fix the **Details**, settings-import, and port-forward review dialogs opening on LuCI 25.12. They now use `ui.showModal(title, content, ...classes)` and keep their action buttons inside the content.

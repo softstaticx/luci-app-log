@@ -6,8 +6,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-log-viewer
-# REFFIX v3.3.3; OpenWrt 25.12 APK only
-PKG_VERSION:=3.3.3
+# REFFIX v3.3.4; OpenWrt 25.12 APK only
+PKG_VERSION:=3.3.4
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=REFFIX
@@ -26,6 +26,7 @@ endef
 
 define Package/luci-app-log-viewer/conffiles
 /etc/config/infra-port-watch
+/etc/config/log-viewer
 endef
 
 define Package/luci-app-log-viewer/description
@@ -40,7 +41,7 @@ define Package/luci-app-log-viewer/install
 	$(INSTALL_DIR) $(1)/www
 	$(CP) ./htdocs/* $(1)/www/
 	$(CP) ./root/* $(1)/
-	chmod 755 $(1)/usr/bin/flint4-geoip $(1)/usr/bin/flint4-geoip-update $(1)/usr/sbin/infra-port-watch $(1)/usr/sbin/infra-port-watch-config $(1)/usr/sbin/log-viewer-history $(1)/etc/init.d/infra-port-watch $(1)/etc/init.d/log-viewer-history $(1)/etc/infra-port-watch.sh $(1)/etc/hotplug.d/iface/99-infra-port-watch
+	chmod 755 $(1)/usr/bin/flint4-geoip $(1)/usr/bin/flint4-geoip-update $(1)/usr/sbin/infra-port-watch $(1)/usr/sbin/infra-port-watch-config $(1)/usr/sbin/log-viewer-history $(1)/usr/sbin/log-viewer-query $(1)/usr/sbin/log-viewer-ip $(1)/etc/init.d/infra-port-watch $(1)/etc/init.d/log-viewer-history $(1)/etc/infra-port-watch.sh $(1)/etc/hotplug.d/iface/99-infra-port-watch
 endef
 
 define Package/luci-app-log-viewer/postinst

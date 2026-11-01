@@ -1,0 +1,5 @@
+config history 'main'
+	option enabled '0'
+	option directory '/srv/log-viewer'
+	option days '7'
+	option max_mb '32'
