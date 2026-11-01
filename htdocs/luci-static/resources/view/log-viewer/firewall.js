@@ -68,6 +68,25 @@ function watchConfigIsFresh(syncedAt, now, ttlMs) {
   return at > 0 && Number(now) - at < Number(ttlMs);
 }
 
+function parseWatchConfig(raw) {
+  try {
+    const config = JSON.parse(raw || '{}');
+    if (!config || typeof config !== 'object' || Array.isArray(config)) return null;
+    return Object.keys(config).length ? config : null;
+  }
+  catch (e) {
+    return null;
+  }
+}
+
+function watchEnabled(config) {
+  return !config || !(config.enabled === false || config.enabled === 0 || config.enabled === '0');
+}
+
+function watchInstalled(config) {
+  return !!config && (config.installed === true || config.installed === 1 || config.installed === '1');
+}
+
 function insightFilterText(source, port, timeline) {
   const parts = [];
   if (source) parts.push(String(source));
@@ -327,6 +346,7 @@ return view.extend({
   viewName: 'firewall',
   title: _('Firewall Log'),
   events: [],
+  eventById: null,
   geoCache: {},
   geoCacheAt: {},
   geoLookupInFlight: new Map(),
@@ -435,9 +455,12 @@ return view.extend({
     try {
       const raw = await fs.exec_direct('/usr/sbin/infra-port-watch', ['get'], 'text');
       if (request !== this.watchConfigRequest) return;
-      this.watchConfig = JSON.parse(raw || '{}');
-      this.routerClockAtSync = Number(this.watchConfig.router_time || 0) * 1000;
-      this.routerClockSyncedAt = Date.now();
+      const config = parseWatchConfig(raw);
+      this.watchConfig = config;
+      if (config) {
+        this.routerClockAtSync = Number(config.router_time || 0) * 1000;
+        this.routerClockSyncedAt = Date.now();
+      }
       this.watchConfigSyncedAt = Date.now();
     }
     catch (e) {
@@ -676,7 +699,9 @@ return view.extend({
     }
     const active = config.active_interface || _('WAN interface unresolved');
     const count = String(config.ports || '').split(/[\s,]+/).filter(Boolean).length;
-    const state = config.enabled ? (config.installed ? _('active') : _('enabled · rules not detected')) : _('disabled');
+    const state = watchEnabled(config)
+      ? (watchInstalled(config) ? _('active') : _('enabled · rules not detected'))
+      : _('disabled');
     const rate = config.log_rate ? ' · ' + config.log_rate : '';
     this.watchStatusText.textContent = _('WAN watch ') + state + ' · IPv4 · ' + active + ' · ' + count + _(' ports') + rate;
   },
@@ -686,7 +711,7 @@ return view.extend({
     const data = {
       schema: 'reffix-firewall-log-settings', version: 1,
       watcher: this.watchConfig ? {
-        enabled: this.watchConfig.enabled !== false,
+        enabled: watchEnabled(this.watchConfig),
         wan_interface: this.watchConfig.wan_interface || 'auto',
         ports: this.watchConfig.ports || ''
       } : null,
@@ -737,16 +762,13 @@ return view.extend({
         E('li', {}, presets.length + _(' saved filter presets')),
         E('li', {}, watcher ? _('Router WAN watch settings will also be updated.') : _('Router WAN watch settings are not included.'))
       ]);
-      ui.showModal(_('Review settings import'), [
-        E('p', {}, _('Review the settings before applying them. Router settings will be written to this router; browser preferences stay local to this browser.')),
-        summary
-      ], [
-        E('button', {class: 'cbi-button', click: ui.hideModal}, _('Cancel')),
-        E('button', {class: 'cbi-button cbi-button-action important', click: async () => {
+      const buttons = E('div', {class: 'fw-modal-actions'}, [
+        E('button', {class: 'cbi-button', type: 'button', click: ui.hideModal}, _('Cancel')),
+        E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: async () => {
           try {
             if (watcher) {
               const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', ['set', watcher.enabled ? '1' : '0', watcher.wan_interface, watcher.ports], 'text');
-              this.watchConfig = JSON.parse(raw || '{}');
+              this.watchConfig = parseWatchConfig(raw);
               this.watchConfigLoaded = true;
               this.watchConfigSyncedAt = Date.now();
             }
@@ -768,6 +790,11 @@ return view.extend({
           location.reload();
         }}, _('Apply settings'))
       ]);
+      ui.showModal(_('Review settings import'), [
+        E('p', {}, _('Review the settings before applying them. Router settings will be written to this router; browser preferences stay local to this browser.')),
+        summary,
+        buttons
+      ], 'fw-modal', 'fw-review-modal');
     };
     reader.readAsText(file);
   },
@@ -793,16 +820,13 @@ return view.extend({
       });
       const check = E('input', {type: 'checkbox', disabled: !valid, checked: valid});
       const protocol = item.protocol || 'tcp';
-      return {item, ports, check, label: E('label', {class: 'fw-settings-field'}, [check,
+      return {item, ports, check, label: E('label', {class: 'fw-settings-field fw-check-field'}, [check,
         E('span', {}, (item.name || _('Unnamed forward')) + ' · ' + (item.source_zone || '?') + ' · ' + portSpec + '/' + protocol +
           (item.destination_port ? ' → destination port ' + item.destination_port : ''))])};
     });
-    ui.showModal(_('Review firewall forwards'), [
-      E('p', {class: 'cbi-section-descr'}, _('Select which WAN-forward destination ports should receive exposed-service labels. This imports labels only; it does not read LAN hostnames or change firewall rules. Verify each entry before importing.')),
-      ...choices.map(choice => choice.label)
-    ], [
-      E('button', {class: 'cbi-button', click: ui.hideModal}, _('Cancel')),
-      E('button', {class: 'cbi-button cbi-button-action important', click: () => {
+    const buttons = E('div', {class: 'fw-modal-actions'}, [
+      E('button', {class: 'cbi-button', type: 'button', click: ui.hideModal}, _('Cancel')),
+      E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: () => {
         const next = Object.assign({}, this.exposedPorts);
         choices.filter(choice => choice.check.checked).forEach(({item, ports}) => {
           const label = String(item.name || 'Exposed service').slice(0, 60);
@@ -818,6 +842,11 @@ return view.extend({
         this.renderInsightsPanel();
       }}, _('Import selected labels'))
     ]);
+    ui.showModal(_('Review firewall forwards'), [
+      E('p', {class: 'cbi-section-descr'}, _('Select which WAN-forward destination ports should receive exposed-service labels. This imports labels only; it does not read LAN hostnames or change firewall rules. Verify each entry before importing.')),
+      ...choices.map(choice => choice.label),
+      buttons
+    ], 'fw-modal', 'fw-review-modal');
   },
 
   parseTrafficContext: function(interfacesText, portsText) {
@@ -834,67 +863,142 @@ return view.extend({
   },
 
   openTrafficSettings: async function() {
-    await this.loadWatchConfig();
-    const interfaces = E('input', {class: 'cbi-input-text', type: 'text', placeholder: _('auto or e.g. eth2')});
-    interfaces.value = this.watchConfig ? this.watchConfig.wan_interface : 'auto';
+    await this.loadWatchConfig(true);
+    const config = this.watchConfig;
+    const wanValue = config && typeof config.wan_interface === 'string' && config.wan_interface ? config.wan_interface : 'auto';
+    const portValue = config && typeof config.ports === 'string' ? config.ports : '';
+    const enabledValue = watchEnabled(config);
+
+    const interfaces = E('input', {class: 'cbi-input-text', type: 'text', placeholder: _('auto or e.g. eth2'), value: wanValue});
     const watching = E('input', {type: 'checkbox'});
-    watching.checked = !this.watchConfig || this.watchConfig.enabled !== false;
-    const watchPorts = E('textarea', {class: 'cbi-input-text', rows: 7, placeholder: _('Comma or whitespace separated ports')});
-    watchPorts.value = this.watchConfig ? this.watchConfig.ports : '';
-    const ports = E('textarea', {class: 'cbi-input-text', rows: 6, placeholder: _('8096 = Jellyfin\n8920 = Jellyfin HTTPS')});
+    watching.checked = enabledValue;
+    const watchPorts = E('textarea', {class: 'cbi-input-text fw-port-list', rows: 7, placeholder: _('One port per line, or separated by commas/spaces'), value: portValue});
+    const ports = E('textarea', {class: 'cbi-input-text fw-port-list', rows: 5, placeholder: _('8096 = Jellyfin\n8920 = Jellyfin HTTPS')});
     ports.value = Object.entries(this.exposedPorts).map(([port, label]) => port + ' = ' + label).join('\n');
-    ui.showModal(_('WAN interface and exposed services'), [
-      E('p', {class: 'cbi-section-descr'}, _('The watch logs matching TCP SYN and UDP probes only. It never accepts or drops traffic. Each source address has its own log budget, and forwarded ports use a smaller one. Auto resolves the logical WAN device. Watch settings are saved on this router; service labels below are saved in this browser.')),
+    const error = E('p', {class: 'fw-modal-error', hidden: true, role: 'alert'});
+    const note = E('p', {class: 'fw-help', hidden: true, role: 'status'});
+    const status = config
+      ? (watchEnabled(config)
+        ? _('Enabled on this router') +
+          (config.active_interface ? _(' · active on ') + config.active_interface : '') +
+          (watchInstalled(config) ? _(' · rules installed') : _(' · rules not detected'))
+        : _('Disabled on this router.'))
+      : _('Current WAN watch status is unavailable. Saving will configure it.');
+
+    const saveButton = E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: async () => {
+      error.hidden = true;
+      note.hidden = true;
+      const wan = interfaces.value.trim() || 'auto';
+      if (!/^(auto|[a-zA-Z0-9_.:-]{1,64})$/.test(wan)) {
+        error.textContent = _('WAN interface may contain only letters, digits, dot, colon, underscore or dash.');
+        error.hidden = false;
+        return;
+      }
+      const uniquePorts = new Set();
+      for (const token of watchPorts.value.split(/[\s,]+/).filter(Boolean)) {
+        if (!/^\d{1,5}$/.test(token)) {
+          error.textContent = _('Invalid port: ') + token;
+          error.hidden = false;
+          return;
+        }
+        const port = Number(token);
+        if (port < 1 || port > 65535) {
+          error.textContent = _('Port out of range: ') + token;
+          error.hidden = false;
+          return;
+        }
+        uniquePorts.add(port);
+      }
+      if (!uniquePorts.size) {
+        error.textContent = _('Add at least one port to the watch list.');
+        error.hidden = false;
+        return;
+      }
+      if (uniquePorts.size > 256) {
+        error.textContent = _('The watch list is limited to 256 ports.');
+        error.hidden = false;
+        return;
+      }
+      saveButton.disabled = true;
+      try {
+        const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', [
+          'set', watching.checked ? '1' : '0', wan, watchPorts.value
+        ], 'text');
+        this.watchConfig = parseWatchConfig(raw);
+        this.watchConfigLoaded = true;
+        this.watchConfigSyncedAt = Date.now();
+      }
+      catch (e) {
+        saveButton.disabled = false;
+        error.textContent = _('Could not apply WAN watch settings: ') + (e.message || e);
+        error.hidden = false;
+        return;
+      }
+      const saved = this.watchConfig;
+      const parsed = this.parseTrafficContext(wan, ports.value);
+      const activeInterface = saved && (saved.active_interface ||
+        (saved.wan_interface !== 'auto' ? saved.wan_interface : ''));
+      this.wanInterfaces = activeInterface ? [String(activeInterface).toLowerCase()] : [];
+      this.exposedPorts = parsed.ports;
+      try { localStorage.setItem('reffix-log-viewer.traffic-context', JSON.stringify({exposedPorts: parsed.ports})); }
+      catch (e) { ui.addNotification(null, E('p', _('Could not save settings in this browser.')), 'warning'); }
+      this.events.forEach(event => this.applyTrafficContext(event));
+      this.historyNeedsReload = true;
+      ui.hideModal();
+      this.renderWatchStatus();
+      this.renderRows();
+      this.renderInsightsPanel();
+      ui.addNotification(null, E('p', _('WAN watch settings saved.')), 'info');
+    }}, _('Save settings'));
+
+    const addDefaults = E('button', {class: 'cbi-button', type: 'button', click: () => {
+      const next = mergeMissingDefaultPorts(watchPorts.value, DEFAULT_WATCH_PORTS);
+      if (!next.ok) {
+        error.textContent = next.reason === 'full'
+          ? _('Adding the missing default ports would pass 256 ports.')
+          : _('The port list contains a value that cannot be kept.');
+        error.hidden = false;
+        return;
+      }
+      watchPorts.value = next.ports;
+      error.hidden = true;
+      note.textContent = next.added.length
+        ? _('Added ') + next.added.length + _(' missing default ports. Save settings to apply them.')
+        : _('Every default port is already in the list.');
+      note.hidden = false;
+    }}, _('Add missing default ports'));
+
+    ui.showModal(_('WAN watch settings'), [
+      E('p', {class: 'cbi-section-descr'}, _('The watch logs matching TCP SYN and UDP probes only. It never accepts or drops traffic. Each source address has its own log budget, and forwarded ports use a smaller one. Auto resolves the logical WAN device. Router settings are saved here; service labels stay in this browser.')),
+      E('div', {class: 'fw-watch-status'}, status),
       E('label', {class: 'fw-settings-field fw-watch-toggle'}, [watching, E('span', {}, _('Enable WAN port watch'))]),
-      E('label', {class: 'fw-settings-field'}, [E('span', {}, _('WAN interface (auto or device name shown in IN=)')), interfaces]),
-      E('label', {class: 'fw-settings-field'}, [E('span', {}, _('Ports to log (1–65535; comma or whitespace separated; up to 256)')), watchPorts]),
-      E('div', {class: 'fw-settings-actions'}, [
-        E('button', {class: 'cbi-button', type: 'button', click: () => {
-          const next = mergeMissingDefaultPorts(watchPorts.value, DEFAULT_WATCH_PORTS);
-          if (!next.ok) {
-            ui.addNotification(null, E('p', next.reason === 'full'
-              ? _('Adding the missing default ports would pass 256 ports.')
-              : _('The port list contains a value that cannot be kept.')), 'error');
-            return;
-          }
-          watchPorts.value = next.ports;
-          ui.addNotification(null, E('p', next.added.length
-            ? _('Added ') + next.added.length + _(' missing default ports. Save settings to apply them.')
-            : _('Every default port is already in the list.')), 'info');
-        }}, _('Add missing default ports'))
+      E('div', {class: 'fw-watch-grid'}, [
+        E('label', {class: 'fw-settings-field'}, [
+          E('span', {}, _('WAN interface')),
+          interfaces,
+          E('small', {}, _('Use auto, or the device name shown in IN= (for example eth2).'))
+        ]),
+        E('label', {class: 'fw-settings-field'}, [
+          E('span', {}, _('Ports to log')),
+          watchPorts,
+          E('small', {}, _('1–65535, separated by commas or spaces, up to 256 ports.'))
+        ])
       ]),
-      E('label', {class: 'fw-settings-field'}, [E('span', {}, _('Exposed destination ports (one port = label per line)')), ports]),
-      E('div', {class: 'right'}, [
-        E('button', {class: 'cbi-button', click: ui.hideModal}, _('Cancel')),
-        E('button', {class: 'cbi-button cbi-button-action important', click: async () => {
-          const wan = interfaces.value.trim() || 'auto';
-          try {
-            const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', [
-              'set', watching.checked ? '1' : '0', wan, watchPorts.value
-            ], 'text');
-            this.watchConfig = JSON.parse(raw || '{}');
-            this.watchConfigLoaded = true;
-            this.watchConfigSyncedAt = Date.now();
-          }
-          catch (e) {
-            ui.addNotification(null, E('p', _('Could not apply WAN watch settings: ') + (e.message || e)), 'error');
-            return;
-          }
-          const config = this.parseTrafficContext(interfaces.value, ports.value);
-          const activeInterface = this.watchConfig.active_interface ||
-            (this.watchConfig.wan_interface !== 'auto' ? this.watchConfig.wan_interface : '');
-          this.wanInterfaces = activeInterface ? [String(activeInterface).toLowerCase()] : [];
-          this.exposedPorts = config.ports;
-          try { localStorage.setItem('reffix-log-viewer.traffic-context', JSON.stringify({exposedPorts: config.ports})); }
-          catch (e) { ui.addNotification(null, E('p', _('Could not save settings in this browser.')), 'warning'); }
-          this.events.forEach(event => this.applyTrafficContext(event));
-          this.historyNeedsReload = true;
-          ui.hideModal();
-          this.renderRows();
-          this.renderInsightsPanel();
-        }}, _('Save settings'))
+      E('div', {class: 'fw-settings-actions'}, [addDefaults]),
+      note,
+      E('h5', {class: 'fw-section-heading'}, _('Service labels')),
+      E('p', {class: 'cbi-section-descr'}, _('Labels stay in this browser and rename watch hits from Blocked to Exposed. They do not change firewall rules.')),
+      E('label', {class: 'fw-settings-field'}, [
+        E('span', {}, _('Exposed destination ports')),
+        ports,
+        E('small', {}, _('One port = label per line.'))
+      ]),
+      error,
+      E('div', {class: 'fw-modal-actions'}, [
+        E('button', {class: 'cbi-button', type: 'button', click: ui.hideModal}, _('Cancel')),
+        saveButton
       ])
-    ]);
+    ], 'fw-modal', 'fw-wan-modal');
   },
 
   addWatchPort: async function(port) {
@@ -917,11 +1021,11 @@ return view.extend({
       return;
     }
     try {
-      const enabled = config.enabled === false || config.enabled === 0 ? '0' : '1';
+      const enabled = watchEnabled(config) ? '1' : '0';
       const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', [
         'set', enabled, config.wan_interface || 'auto', next.ports
       ], 'text');
-      this.watchConfig = JSON.parse(raw || '{}');
+      this.watchConfig = parseWatchConfig(raw);
       this.watchConfigLoaded = true;
       this.watchConfigSyncedAt = Date.now();
     }
@@ -1365,6 +1469,7 @@ return view.extend({
     const matching = this.getMatchingEvents(windowed);
     this.filteredEvents = matching;
     const events = matching.slice(0, this.maxEntries);
+    this.eventById = new Map(events.map(event => [String(event.id), event]));
     let blocked = 0, allowed = 0, exposed = 0, other = 0;
     matching.forEach(e => {
       if (e.kind === 'Blocked') blocked++;
@@ -1425,6 +1530,69 @@ return view.extend({
         color-scheme: dark;
       }
       .fw-shell * { box-sizing: border-box; }
+      .fw-modal {
+        --mp-bg: #2D2A2E;
+        --mp-panel: #221F22;
+        --mp-surface: #343136;
+        --mp-hover: #403E41;
+        --mp-border: #514D52;
+        --mp-fg: #FCFCFA;
+        --mp-muted: #C7C3C8;
+        --mp-yellow: #FFD866;
+        --mp-orange: #FC9867;
+        --mp-pink: #FF6188;
+        --mp-green: #A9DC76;
+        --mp-cyan: #78DCE8;
+        --mp-purple: #AB9DF2;
+        width: min(760px, 94vw);
+        max-height: 88vh;
+        overflow-y: auto;
+        color: var(--mp-fg);
+        background: var(--mp-bg);
+        color-scheme: dark;
+        text-align: left;
+      }
+      .fw-modal * { box-sizing: border-box; }
+      .fw-modal h4 { margin: 0 0 10px; color: var(--mp-fg); font-size: 17px; line-height: 1.3; }
+      .fw-modal .cbi-section-descr { margin: 0 0 8px; color: var(--mp-muted) !important; font-size: 13px !important; line-height: 1.6 !important; font-weight: 500; }
+      .fw-modal .fw-watch-status { margin: 10px 0 2px; padding: 9px 11px; color: var(--mp-muted); background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 8px; font-size: 12px; line-height: 1.5; }
+      .fw-modal .fw-watch-grid { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr); gap: 14px; align-items: start; }
+      .fw-modal .fw-settings-field { display: grid; gap: 6px; margin: 12px 0; color: var(--mp-fg); font-weight: 650; }
+      .fw-modal .fw-settings-field > span { font-size: 13px; }
+      .fw-modal .fw-settings-field small { color: var(--mp-muted); font-size: 12px; font-weight: 500; line-height: 1.45; }
+      .fw-modal .fw-watch-toggle { display: flex; align-items: center; gap: 9px; margin: 12px 0; }
+      .fw-modal .fw-watch-toggle input { width: 16px; height: 16px; margin: 0; }
+      .fw-modal .fw-check-field { display: flex; align-items: flex-start; gap: 9px; }
+      .fw-modal .fw-check-field input { width: 16px; height: 16px; margin: 2px 0 0; flex: 0 0 auto; }
+      .fw-modal input.cbi-input-text,
+      .fw-modal textarea.cbi-input-text {
+        width: 100%;
+        min-height: 38px;
+        margin: 0;
+        padding: 8px 10px;
+        color: var(--mp-fg) !important;
+        background: var(--mp-surface) !important;
+        border: 1px solid var(--mp-border) !important;
+        border-radius: 7px;
+        font: inherit;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .fw-modal textarea.cbi-input-text { resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .fw-modal input.cbi-input-text:focus,
+      .fw-modal textarea.cbi-input-text:focus { outline: 2px solid var(--mp-purple); outline-offset: 1px; border-color: var(--mp-purple) !important; }
+      .fw-modal .fw-settings-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 2px; }
+      .fw-modal .fw-section-heading { margin: 18px 0 2px; padding-top: 14px; color: var(--mp-fg); border-top: 1px solid var(--mp-border); font-size: 14px; }
+      .fw-modal .fw-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--mp-border); position: sticky; bottom: -1px; background: var(--mp-bg); }
+      .fw-modal .fw-modal-error { margin: 10px 0 0; padding: 8px 10px; color: #FFD6E7; background: #4A2431; border: 1px solid #8B3E57; border-radius: 7px; font-size: 12px; line-height: 1.5; }
+      .fw-modal .fw-help { margin: 4px 0 0; color: var(--mp-muted); font-size: 12px; line-height: 1.5; }
+      .fw-details-modal { width: min(680px, 94vw); }
+      .fw-details-modal .fw-event-meta { margin-top: 4px; }
+      .fw-details-modal h3 { margin: 16px 0 6px; font-size: 13px; }
+      .fw-details-modal .fw-raw-log { margin: 0; padding: 10px; color: var(--mp-fg); background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 7px; }
+      @media (max-width: 700px) {
+        .fw-modal .fw-watch-grid { grid-template-columns: 1fr; gap: 0; }
+      }
       .fw-shell .fw-description {
         color: var(--mp-muted) !important;
         font-size: 13px !important;
@@ -1927,7 +2095,7 @@ return view.extend({
           E('h3', {}, _('WAN watch')),
           E('p', {class: 'fw-muted'}, _('Choose the WAN device and the known ports to log at the full per-address budget. Every other WAN port is sampled at 2 lines per minute per address. Forwarded ports use a smaller budget. The watch never accepts or drops traffic.')),
           E('div', {class: 'fw-settings-actions'}, [
-            E('button', {class: 'cbi-button cbi-button-action', click: () => this.openTrafficSettings()}, _('Edit WAN watch'))
+            E('button', {class: 'cbi-button cbi-button-action', type: 'button', click: () => this.openTrafficSettings()}, _('WAN watch settings'))
           ]),
           this.watchStatusText
         ]),
@@ -1992,7 +2160,8 @@ return view.extend({
     this.tbody.addEventListener('click', ev => {
       const detailButton = ev.target.closest('.fw-event-details');
       if (detailButton) {
-        const event = this.events.find(item => String(item.id) === detailButton.getAttribute('data-id'));
+        const event = (this.eventById && this.eventById.get(detailButton.getAttribute('data-id'))) ||
+          this.events.find(item => String(item.id) === detailButton.getAttribute('data-id'));
         if (event) this.showEventDetails(event);
       }
     });
@@ -2087,19 +2256,23 @@ return view.extend({
       ['Log marker', event.marker], ['Event prefix', event.prefix],
       ['Policy label', event.policyLabel], ['Policy note', event.policyNote]
     ];
-    const actions = [E('button', {class: 'cbi-button cbi-button-action important', click: ui.hideModal}, _('Close'))];
+    const buttons = [E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: ui.hideModal}, _('Close'))];
     const destinationPort = Number(event.dport);
     if (event.kind === 'Other' && Number.isInteger(destinationPort) && destinationPort >= 1 && destinationPort <= 65535)
-      actions.unshift(E('button', {class: 'cbi-button', click: () => {
+      buttons.unshift(E('button', {class: 'cbi-button', type: 'button', click: () => {
         this.addWatchPort(destinationPort).catch(e => ui.addNotification(null, E('p', e.message || e), 'error'));
       }}, _('Log this port at the full budget')));
+    const metaRows = [];
+    rows.forEach(row => metaRows.push(
+      E('dt', {}, _(row[0])),
+      E('dd', {}, String(row[1] == null || row[1] === '' ? '—' : row[1]))
+    ));
     ui.showModal(_('Firewall event details'), [
-      E('dl', {class: 'fw-event-meta'}, rows.flatMap(row => [
-        E('dt', {}, _(row[0])), E('dd', {}, String(row[1] == null || row[1] === '' ? '—' : row[1]))
-      ])),
+      E('dl', {class: 'fw-event-meta'}, metaRows),
       E('h3', {}, _('Original log line')),
-      E('pre', {class: 'fw-raw-log'}, event.rawLine || '')
-    ], actions);
+      E('pre', {class: 'fw-raw-log'}, event.rawLine || ''),
+      E('div', {class: 'fw-modal-actions'}, buttons)
+    ], 'fw-modal', 'fw-details-modal');
   },
 
   exportCSV: function(allLoaded) {
@@ -2119,6 +2292,7 @@ return view.extend({
     if (this.searchTimer) clearTimeout(this.searchTimer);
     this.refreshGeneration++;
     this.tbody = null;
+    this.eventById = null;
     this.insights = null;
   }
 });

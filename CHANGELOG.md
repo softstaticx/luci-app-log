@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.3.3 (2026-11-01)
+
+- Fix the **Details**, settings-import, and port-forward review dialogs opening on LuCI 25.12. They now use `ui.showModal(title, content, ...classes)` and keep their action buttons inside the content.
+- Redesign the **WAN watch settings** dialog with a status summary, labelled two-column layout, inline validation, sticky actions, and no more `undefined` fields.
+- Treat an empty or malformed WAN status response as unavailable instead of reporting a disabled watch with zero ports.
+- Keep the event-details lookup stable across live refreshes.
+
 ## v3.3.2 (2026-11-01)
 
 - Fix the online installer failing with `has no package version` on OpenWrt 25.12. APK v3 packages are ADB archives, not gzipped tarballs, so the installer now reads `info.version` through `apk adbdump` and keeps the tarred `.PKGINFO` fallback for APK v2.

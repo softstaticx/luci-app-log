@@ -1,12 +1,14 @@
-# luci-app-log v3.3.2
+# luci-app-log v3.3.3
 
 OpenWrt 25.12 release. The package name remains `luci-app-log-viewer`. IPv4 only.
 
 ## This release
 
-The online installer now reads APK v3 metadata through `apk adbdump`, fixing the `has no package version` failure on OpenWrt 25.12. APK v2 packages still fall back to the tarred `.PKGINFO` file.
+The **Details** dialog, the settings-import review, and the firewall-forward label review now open again on LuCI 25.12. The dialogs were using the older `ui.showModal(title, content, buttons)` call, where the third argument is now treated as a CSS class; their action buttons now live inside the dialog content.
 
-The WAN watch also starts cleanly after package install: `/lib/functions.sh` config globals are initialized before the firewall config is loaded, so `set -u` no longer aborts with `CONFIG_LIST_STATE: parameter not set`.
+The **WAN watch settings** dialog has been rebuilt: it shows the current watch state, uses a labelled two-column form, validates ports and the WAN device before saving, keeps the save/cancel actions visible, and no longer shows `undefined` when the status response is missing.
+
+The online installer still reads APK v3 metadata through `apk adbdump`, and the WAN watch still initializes the `/lib/functions.sh` config globals before loading the firewall config.
 
 Running the installer again upgrades an older `luci-app-log-viewer`. The same release is removed and installed again, so the files match the download. A newer installed app is left alone. `/etc/config/infra-port-watch` stays either way.
 

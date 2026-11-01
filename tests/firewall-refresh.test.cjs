@@ -124,3 +124,41 @@ test('missing default ports are appended and GeoIP can be refreshed from setting
   assert.match(source, /Update GeoIP databases/);
   assert.match(source, /\/usr\/bin\/flint4-geoip-update/);
 });
+
+test('modals use the LuCI 25.12 showModal signature and keep actions in content', () => {
+  assert.equal((source.match(/ui\.showModal\(/g) || []).length, 4);
+  assert.equal((source.match(/\n\s*\], 'fw-modal', 'fw-[^']+'\);/g) || []).length, 4);
+  assert.match(source, /fw-modal-actions/);
+  assert.match(source, /fw-watch-grid/);
+  assert.match(source, /fw-watch-status/);
+  assert.match(source, /this\.eventById = new Map/);
+  assert.match(source, /this\.eventById\.get/);
+  assert.doesNotMatch(source, /_\('Edit WAN watch'\)/);
+  assert.match(source, /_\('WAN watch settings'\)/);
+});
+
+test('empty or malformed watch status is treated as unavailable', () => {
+  const parseWatchConfig = extract('parseWatchConfig');
+  assert.equal(parseWatchConfig(''), null);
+  assert.equal(parseWatchConfig('{}'), null);
+  assert.equal(parseWatchConfig('null'), null);
+  assert.equal(parseWatchConfig('{'), null);
+  assert.deepEqual(parseWatchConfig('{"enabled":true,"wan_interface":"auto","ports":"22"}'), {
+    enabled: true, wan_interface: 'auto', ports: '22'
+  });
+  assert.match(source, /const config = parseWatchConfig\(raw\);/);
+  assert.match(source, /this\.watchConfig = parseWatchConfig\(raw\);/);
+
+  const watchEnabled = extract('watchEnabled');
+  assert.equal(watchEnabled(null), true);
+  assert.equal(watchEnabled({enabled: false}), false);
+  assert.equal(watchEnabled({enabled: 0}), false);
+  assert.equal(watchEnabled({enabled: '0'}), false);
+  assert.equal(watchEnabled({enabled: true}), true);
+
+  const watchInstalled = extract('watchInstalled');
+  assert.equal(watchInstalled(null), false);
+  assert.equal(watchInstalled({installed: false}), false);
+  assert.equal(watchInstalled({installed: true}), true);
+  assert.equal(watchInstalled({installed: 1}), true);
+});
