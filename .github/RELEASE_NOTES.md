@@ -6,6 +6,8 @@ OpenWrt 25.12 release. The package name remains `luci-app-log-viewer`. IPv4 only
 
 The online installer now reads APK v3 metadata through `apk adbdump`, fixing the `has no package version` failure on OpenWrt 25.12. APK v2 packages still fall back to the tarred `.PKGINFO` file.
 
+The WAN watch also starts cleanly after package install: `/lib/functions.sh` config globals are initialized before the firewall config is loaded, so `set -u` no longer aborts with `CONFIG_LIST_STATE: parameter not set`.
+
 Running the installer again upgrades an older `luci-app-log-viewer`. The same release is removed and installed again, so the files match the download. A newer installed app is left alone. `/etc/config/infra-port-watch` stays either way.
 
 The package depends on `iptables-mod-hashlimit`, so each source address keeps its own log budget. If the match cannot be loaded, the watch falls back to one shared limit and the status line says so.

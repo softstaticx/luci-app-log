@@ -7,6 +7,14 @@ set -eu
 # Initialize it before sourcing that library so nounset cannot abort startup.
 IPKG_INSTROOT="${IPKG_INSTROOT:-}"
 
+# /lib/config/uci.sh reads CONFIG_LIST_STATE directly while parsing a package,
+# and the config callbacks read NO_CALLBACK. Initialize the globals that the
+# stock library expects to exist so `set -u` does not abort config_load.
+CONFIG_LIST_STATE="${CONFIG_LIST_STATE:-}"
+CONFIG_SECTIONS="${CONFIG_SECTIONS:-}"
+CONFIG_NUM_SECTIONS="${CONFIG_NUM_SECTIONS:-0}"
+NO_CALLBACK="${NO_CALLBACK:-}"
+
 CONFIG=infra-port-watch.main
 MATCH_CHAIN=REFFIX_INFRA_WATCH
 LOG_CHAIN=INFRA_PORT_LOG

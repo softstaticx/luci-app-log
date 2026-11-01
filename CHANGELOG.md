@@ -3,6 +3,7 @@
 ## v3.3.2 (2026-11-01)
 
 - Fix the online installer failing with `has no package version` on OpenWrt 25.12. APK v3 packages are ADB archives, not gzipped tarballs, so the installer now reads `info.version` through `apk adbdump` and keeps the tarred `.PKGINFO` fallback for APK v2.
+- Initialize the `/lib/functions.sh` config globals before loading the firewall config, so package post-install starts the WAN watch instead of aborting with `CONFIG_LIST_STATE: parameter not set`.
 - Rename the README and GitHub release title to `luci-app-log`; the package remains `luci-app-log-viewer`.
 
 ## v3.3.1 (2026-10-31)
