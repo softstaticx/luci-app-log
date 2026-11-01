@@ -84,7 +84,7 @@ write_status() {
   mv "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
 }
 
-status() { flush_persist; status_json; }
+status() { flush_persist 2>/dev/null || true; status_json; }
 
 is_firewall_line() {
   line="$1"
@@ -135,7 +135,7 @@ follow_log() {
 
 refresh_persist_file() {
   [ "$PERSIST_ENABLED" = 1 ] || return 0
-  mkdir -p "$PERSIST_DIR"
+  mkdir -p "$PERSIST_DIR" 2>/dev/null || return 1
   PERSIST_FILE="$PERSIST_DIR/firewall-$(date +%Y-%m-%d).log"
 }
 
@@ -160,16 +160,16 @@ prune_persist() {
 flush_persist() {
   [ "$PERSIST_ENABLED" = 1 ] || return 0
   [ -s "$BUFFER" ] || return 0
-  refresh_persist_file
-  cat "$BUFFER" >> "$PERSIST_FILE"
+  refresh_persist_file || return 0
+  cat "$BUFFER" >> "$PERSIST_FILE" 2>/dev/null || return 0
   : > "$BUFFER"
-  prune_persist
+  prune_persist || true
 }
 
 append_persist() {
   [ "$PERSIST_ENABLED" = 1 ] || return 0
-  mkdir -p "$(dirname "$BUFFER")"
-  printf '%s\n' "$1" >> "$BUFFER"
+  mkdir -p "$(dirname "$BUFFER")" 2>/dev/null || return 0
+  printf '%s\n' "$1" >> "$BUFFER" 2>/dev/null || return 0
   PERSIST_TICK=$((PERSIST_TICK + 1))
   if [ $((PERSIST_TICK % 200)) -eq 0 ]; then
     flush_persist
