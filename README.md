@@ -1,6 +1,6 @@
 <img width="1920" height="1080" alt="Firewall Log" src="https://github.com/user-attachments/assets/c0774cb6-6b59-4271-b1c7-5aa9944f68a8" />
 
-# REFFIX Firewall Log
+# luci-app-log
 
 OpenWrt 25.12 LuCI page for the IPv4 firewall log. It classifies events locally, looks up country and ASN from GeoLite2 on the router, and can log WAN probes without accepting or dropping them. The package name is `luci-app-log-viewer`.
 

@@ -1,8 +1,10 @@
-# REFFIX Firewall Log v3.3.1
+# luci-app-log v3.3.2
 
 OpenWrt 25.12 release. The package name remains `luci-app-log-viewer`. IPv4 only.
 
 ## This release
+
+The online installer now reads APK v3 metadata through `apk adbdump`, fixing the `has no package version` failure on OpenWrt 25.12. APK v2 packages still fall back to the tarred `.PKGINFO` file.
 
 Running the installer again upgrades an older `luci-app-log-viewer`. The same release is removed and installed again, so the files match the download. A newer installed app is left alone. `/etc/config/infra-port-watch` stays either way.
 
