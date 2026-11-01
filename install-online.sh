@@ -33,7 +33,26 @@ verify_checksums() {
 }
 
 pkgver_of() {
-  tar -xOf "$1" .PKGINFO 2>/dev/null | sed -n 's/^pkgver = //p' | head -n 1
+  pkg="$1"
+  # APK v3 packages are ADB archives, not gzipped tarballs, so there is no
+  # .PKGINFO member for tar to read. Let apk decode the control section.
+  if command -v apk >/dev/null 2>&1; then
+    ver="$(apk adbdump "$pkg" 2>/dev/null | awk '
+      /^info:[[:space:]]*$/ { in_info = 1; next }
+      in_info && /^  version:[[:space:]]/ {
+        sub(/^  version:[[:space:]]*/, "")
+        print
+        exit
+      }
+      in_info && /^[^[:space:]]/ { exit }
+    ')" || ver=""
+    if [ -n "$ver" ]; then
+      printf '%s\n' "$ver"
+      return 0
+    fi
+  fi
+  # APK v2 packages still carry a tarred .PKGINFO control file.
+  tar -xOf "$pkg" .PKGINFO 2>/dev/null | sed -n 's/^pkgver = //p' | head -n 1
 }
 
 installed_pkgver() {
@@ -45,7 +64,11 @@ pkg_action() {
   name="$1"
   file="$2"
   PKG_NEW="$(pkgver_of "$file")"
-  [ -n "$PKG_NEW" ] || { echo "ERROR: $file has no package version." >&2; return 1; }
+  [ -n "$PKG_NEW" ] || {
+    echo "ERROR: couldn't read the package version from $file." >&2
+    echo "The APK metadata is unreadable or the download is corrupt." >&2
+    return 1
+  }
   PKG_OLD="$(installed_pkgver "$name")"
   if [ -z "$PKG_OLD" ]; then
     PKG_ACT=install
