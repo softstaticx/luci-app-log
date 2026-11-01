@@ -2,14 +2,16 @@
 # Validated LuCI configuration writer for the WAN port-watch service.
 set -eu
 
-[ "${1:-}" = set ] && [ "$#" -eq 4 ] || {
-	echo 'usage: infra-port-watch-config set <0|1> <auto|interface> <ports>' >&2
+[ "${1:-}" = set ] && { [ "$#" -eq 4 ] || [ "$#" -eq 5 ]; } || {
+	echo 'usage: infra-port-watch-config set <0|1> <auto|interface> <ports> [sample-other-ports 0|1]' >&2
 	exit 2
 }
 enabled="$2"
 wan="$3"
 ports_input="$(printf '%s' "$4" | tr ',\n\t' '   ')"
+other_ports="${5:-0}"
 case "$enabled" in 0|1) ;; *) echo 'enabled must be 0 or 1' >&2; exit 2 ;; esac
+case "$other_ports" in 0|1) ;; *) echo 'sample-other-ports must be 0 or 1' >&2; exit 2 ;; esac
 case "$wan" in
 	auto) ;;
 	''|*[!a-zA-Z0-9_.:-]*) echo 'invalid WAN interface' >&2; exit 2 ;;
@@ -33,6 +35,7 @@ done
 uci -q get infra-port-watch.main >/dev/null 2>&1 || uci set infra-port-watch.main=watch
 uci set "infra-port-watch.main.enabled=$enabled"
 uci set "infra-port-watch.main.wan_interface=$wan"
+uci set "infra-port-watch.main.log_other_ports=$other_ports"
 uci -q delete infra-port-watch.main.ports 2>/dev/null || true
 for port in $normalized; do uci add_list "infra-port-watch.main.ports=$port"; done
 uci commit infra-port-watch

@@ -1,6 +1,7 @@
 config watch 'main'
 	option enabled '1'
 	option wan_interface 'auto'
+	option log_other_ports '0'
 	list ports '21'
 	list ports '22'
 	list ports '23'

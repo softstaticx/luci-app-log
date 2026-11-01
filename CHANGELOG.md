@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.3.5 (2026-11-01)
+
+- Stop the low-rate other-port sample by default. The watch now logs only ports on the configured list, and they remain Blocked unless an allow or forward applies.
+- Make other-port sampling opt-in with **Settings → WAN watch settings → Also sample other ports**. Existing configurations default to off.
+- Default the table, chips, and insights to **Known ports only**, so old other-port samples do not flood the page. Choose **All verdict types** to inspect them.
+- Add migration-safe defaults for existing `/etc/config/infra-port-watch` files and preserve the sample setting when adding a port or importing settings.
+
 ## v3.3.4 (2026-11-01)
 
 - Click a source IP to open a detail drawer with all events in view, ports, first/last seen, reverse DNS, copy IP/log line, and one-click port-watch actions.

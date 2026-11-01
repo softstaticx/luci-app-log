@@ -139,6 +139,14 @@ test('server history, sorting, chips and the source drawer are wired', () => {
   assert.match(source, /formatBytes/);
 });
 
+test('known ports are shown by default and other-port sampling is opt-in', () => {
+  assert.match(source, /kindFilter: 'known'/);
+  assert.match(source, /Known ports only/);
+  assert.match(source, /Also sample other ports/);
+  assert.match(source, /log_other_ports/);
+  assert.match(source, /otherSample\.checked/);
+});
+
 test('modals use the LuCI 25.12 showModal signature and keep actions in content', () => {
   assert.equal((source.match(/ui\.showModal\(/g) || []).length, 9);
   assert.equal((source.match(/'fw-modal'/g) || []).length, 9);

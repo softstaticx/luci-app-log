@@ -376,7 +376,7 @@ return view.extend({
   geoCache: {},
   geoCacheAt: {},
   geoLookupInFlight: new Map(),
-  kindFilter: 'all',
+  kindFilter: 'known',
   protoFilter: 'all',
   timeFilter: 'all',
   sourceFilter: '',
@@ -564,7 +564,7 @@ return view.extend({
       const presets = JSON.parse(localStorage.getItem('reffix-log-viewer.filters') || '[]');
       this.filterPresets = Array.isArray(presets) ? presets.filter(p =>
         p && typeof p.name === 'string' && typeof p.query === 'string' &&
-        ['all', 'blocked', 'other', 'observed', 'allowed', 'exposed'].includes(p.kind) &&
+        ['known', 'all', 'blocked', 'other', 'observed', 'allowed', 'exposed'].includes(p.kind) &&
         ['all', 'tcp', 'udp'].includes(p.proto) &&
         ['all', '5m', '15m', '1h', '6h', '24h'].includes(p.window)
       ).slice(0, 20) : [];
@@ -746,7 +746,8 @@ return view.extend({
       watcher: this.watchConfig ? {
         enabled: watchEnabled(this.watchConfig),
         wan_interface: this.watchConfig.wan_interface || 'auto',
-        ports: this.watchConfig.ports || ''
+        ports: this.watchConfig.ports || '',
+        log_other_ports: this.watchConfig.log_other_ports === 1 || this.watchConfig.log_other_ports === '1' ? 1 : 0
       } : null,
       browser: {
         exposedPorts: this.exposedPorts,
@@ -781,7 +782,7 @@ return view.extend({
       }
       const presets = Array.isArray(browser.filterPresets) ? browser.filterPresets.filter(p =>
         p && typeof p.name === 'string' && typeof p.query === 'string' &&
-        ['all', 'blocked', 'other', 'observed', 'allowed', 'exposed'].includes(p.kind) &&
+        ['known', 'all', 'blocked', 'other', 'observed', 'allowed', 'exposed'].includes(p.kind) &&
         ['all', 'tcp', 'udp'].includes(p.proto) && ['all', '5m', '15m', '1h', '6h', '24h'].includes(p.window)
       ).slice(0, 20) : [];
       const watcher = data.watcher;
@@ -800,7 +801,7 @@ return view.extend({
         E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: async () => {
           try {
             if (watcher) {
-              const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', ['set', watcher.enabled ? '1' : '0', watcher.wan_interface, watcher.ports], 'text');
+              const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', ['set', watcher.enabled ? '1' : '0', watcher.wan_interface, watcher.ports, watcher.log_other_ports ? '1' : '0'], 'text');
               this.watchConfig = parseWatchConfig(raw);
               this.watchConfigLoaded = true;
               this.watchConfigSyncedAt = Date.now();
@@ -1099,6 +1100,8 @@ return view.extend({
     const interfaces = E('input', {class: 'cbi-input-text', type: 'text', placeholder: _('auto or e.g. eth2'), value: wanValue});
     const watching = E('input', {type: 'checkbox'});
     watching.checked = enabledValue;
+    const otherSample = E('input', {type: 'checkbox'});
+    otherSample.checked = !!(config && (config.log_other_ports === 1 || config.log_other_ports === '1' || config.log_other_ports === true));
     const watchPorts = E('textarea', {class: 'cbi-input-text fw-port-list', rows: 7, placeholder: _('One port per line, or separated by commas/spaces'), value: portValue});
     const ports = E('textarea', {class: 'cbi-input-text fw-port-list', rows: 5, placeholder: _('8096 = Jellyfin\n8920 = Jellyfin HTTPS')});
     ports.value = Object.entries(this.exposedPorts).map(([port, label]) => port + ' = ' + label).join('\n');
@@ -1108,7 +1111,8 @@ return view.extend({
       ? (watchEnabled(config)
         ? _('Enabled on this router') +
           (config.active_interface ? _(' · active on ') + config.active_interface : '') +
-          (watchInstalled(config) ? _(' · rules installed') : _(' · rules not detected'))
+          (watchInstalled(config) ? _(' · rules installed') : _(' · rules not detected')) +
+          (otherSample.checked ? _(' · other-port sample on') : _(' · other-port sample off'))
         : _('Disabled on this router.'))
       : _('Current WAN watch status is unavailable. Saving will configure it.');
 
@@ -1149,7 +1153,7 @@ return view.extend({
       saveButton.disabled = true;
       try {
         const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', [
-          'set', watching.checked ? '1' : '0', wan, watchPorts.value
+          'set', watching.checked ? '1' : '0', wan, watchPorts.value, otherSample.checked ? '1' : '0'
         ], 'text');
         this.watchConfig = parseWatchConfig(raw);
         this.watchConfigLoaded = true;
@@ -1196,9 +1200,11 @@ return view.extend({
     }}, _('Add missing default ports'));
 
     ui.showModal(_('WAN watch settings'), [
-      E('p', {class: 'cbi-section-descr'}, _('The watch logs matching TCP SYN and UDP probes only. It never accepts or drops traffic. Each source address has its own log budget, and forwarded ports use a smaller one. Auto resolves the logical WAN device. Router settings are saved here; service labels stay in this browser.')),
+      E('p', {class: 'cbi-section-descr'}, _('The watch logs matching TCP SYN and UDP probes only. It never accepts or drops traffic. Each source address has its own log budget, and forwarded ports use a smaller one. Only ports on the list are logged by default; the optional other-port sample is off. Auto resolves the logical WAN device. Router settings are saved here; service labels stay in this browser.')),
       E('div', {class: 'fw-watch-status'}, status),
       E('label', {class: 'fw-settings-field fw-watch-toggle'}, [watching, E('span', {}, _('Enable WAN port watch'))]),
+      E('label', {class: 'fw-settings-field fw-watch-toggle'}, [otherSample, E('span', {}, _('Also sample other ports (low rate)'))]),
+      E('p', {class: 'fw-help'}, _('Leave this off to see only the known port list. When on, unknown WAN ports are logged at 2 lines per minute per source and shown as Other.')),
       E('div', {class: 'fw-watch-grid'}, [
         E('label', {class: 'fw-settings-field'}, [
           E('span', {}, _('WAN interface')),
@@ -1249,8 +1255,9 @@ return view.extend({
     }
     try {
       const enabled = watchEnabled(config) ? '1' : '0';
+      const other = config.log_other_ports === 1 || config.log_other_ports === '1' ? '1' : '0';
       const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', [
-        'set', enabled, config.wan_interface || 'auto', next.ports
+        'set', enabled, config.wan_interface || 'auto', next.ports, other
       ], 'text');
       this.watchConfig = parseWatchConfig(raw);
       this.watchConfigLoaded = true;
@@ -1473,7 +1480,7 @@ return view.extend({
       '<div class="fw-insight"><h3>Top ASNs</h3>' + topAsns + '</div>' +
       '<div class="fw-insight"><h3>Scan / burst signals</h3><p class="fw-muted">Heuristic only: 8+ ports or 25+ events from one public source.</p>' + scanHtml + '</div>' +
       '<div class="fw-insight fw-insight-policy"><h3>Policy context</h3><p class="fw-muted">' + esc(policyNotes) + '</p>' +
-      '<p class="fw-muted">A known-port probe is Blocked when nothing allows or forwards it. Other is a low-rate sample of a port outside that list. Allowed appears only when an allow rule logs it.</p></div>';
+      '<p class="fw-muted">A known-port probe is Blocked when nothing allows or forwards it. Other is an optional low-rate sample outside that list; it is off by default. Allowed appears only when an allow rule logs it.</p></div>';
   },
 
 
@@ -1706,7 +1713,11 @@ return view.extend({
         e.protocol, e.prefix, e.marker, e.policyLabel, e.policyNote,
         geo.country_name, geo.country_code, geo.asn_organization
       ].join(' ').toLowerCase();
-      return (this.kindFilter === 'all' || e.kind.toLowerCase() === this.kindFilter) &&
+      const kindMatches = this.kindFilter === 'all' ||
+        (this.kindFilter === 'known'
+          ? e.kind !== 'Other' && e.kind !== 'Observed'
+          : e.kind.toLowerCase() === this.kindFilter);
+      return kindMatches &&
         (this.protoFilter === 'all' || e.protocol.toLowerCase() === this.protoFilter) &&
         (!this.sourceFilter || e.source === this.sourceFilter) &&
         (!this.countryFilter || String(geo.country_code || '').toUpperCase() === this.countryFilter) &&
@@ -1761,7 +1772,12 @@ return view.extend({
   },
 
   renderInsightsPanel: function() {
-    if (this.insights) this.insights.innerHTML = this.renderInsights(this.getTimeFilteredEvents());
+    if (!this.insights) return;
+    const events = this.getTimeFilteredEvents();
+    const scoped = this.kindFilter === 'known'
+      ? events.filter(event => event.kind !== 'Other' && event.kind !== 'Observed')
+      : events;
+    this.insights.innerHTML = this.renderInsights(scoped);
   },
 
   renderGeoStatus: function() {
@@ -1846,7 +1862,12 @@ return view.extend({
       class: 'fw-chip' + (active ? ' active' : '')
     }, attrs), label);
     const items = [];
+    const knownCount = (verdicts.get('Blocked') || 0) + (verdicts.get('Exposed') || 0) + (verdicts.get('Allowed') || 0);
+    if (knownCount) items.push(chip(_('Known ports') + ' ' + knownCount, this.kindFilter === 'known', {
+      'data-chip': 'kind', 'data-value': 'known'
+    }));
     ['Blocked', 'Other', 'Exposed', 'Allowed', 'Observed'].forEach(kind => {
+      if ((kind === 'Other' || kind === 'Observed') && this.kindFilter === 'known') return;
       const count = verdicts.get(kind) || 0;
       if (count) items.push(chip(kind + ' ' + count, this.kindFilter === kind.toLowerCase(), {
         'data-chip': 'kind', 'data-value': kind.toLowerCase()
@@ -2423,6 +2444,7 @@ return view.extend({
     this.stats = E('div', {class: 'fw-stats'});
     this.search = E('input', {class: 'cbi-input-text', type: 'search', placeholder: _('Search IP, country, ASN, port or service…'), 'aria-label': _('Search firewall events')});
     this.kind = E('select', {class: 'cbi-input-select', 'aria-label': _('Filter by verdict')}, [
+      E('option', {value: 'known'}, _('Known ports only')),
       E('option', {value: 'all'}, _('All verdict types')),
       E('option', {value: 'blocked'}, _('Blocked only')),
       E('option', {value: 'other'}, _('Other ports')),
@@ -2430,6 +2452,7 @@ return view.extend({
       E('option', {value: 'observed'}, _('Other interface / unclassified')),
       E('option', {value: 'allowed'}, _('Allowed · explicit logs only'))
     ]);
+    this.kind.value = this.kindFilter;
     this.proto = E('select', {class: 'cbi-input-select', 'aria-label': _('Filter by protocol')}, [
       E('option', {value: 'all'}, _('All protocols')),
       E('option', {value: 'tcp'}, 'TCP'),
@@ -2524,7 +2547,7 @@ return view.extend({
       E('div', {class: 'fw-more-content'}, [
         E('section', {class: 'fw-settings-section fw-settings-watch'}, [
           E('h3', {}, _('WAN watch')),
-          E('p', {class: 'fw-muted'}, _('Choose the WAN device and the known ports to log at the full per-address budget. Every other WAN port is sampled at 2 lines per minute per address. Forwarded ports use a smaller budget. The watch never accepts or drops traffic.')),
+          E('p', {class: 'fw-muted'}, _('Choose the WAN device and the known ports to log at the full per-address budget. Only ports on this list are logged by default; the optional other-port sample is off. Forwarded ports use a smaller budget. The watch never accepts or drops traffic.')),
           E('div', {class: 'fw-settings-actions'}, [
             E('button', {class: 'cbi-button cbi-button-action', type: 'button', click: () => this.openTrafficSettings()}, _('WAN watch settings'))
           ]),
@@ -2572,7 +2595,7 @@ return view.extend({
     ]);
 
     const result = E('div', {class: 'fw-shell'}, [
-      E('p', {class: 'cbi-section-descr fw-description'}, _('Each row is one firewall event. A known-port probe is Blocked when nothing allows or forwards it. Other is a low-rate sample of a port outside that list. Allowed requires an explicit ALLOW/ACCEPT log. GeoIP lookups stay local.')),
+      E('p', {class: 'cbi-section-descr fw-description'}, _('Each row is one firewall event. A known-port probe is Blocked when nothing allows or forwards it. Other is an optional low-rate sample outside that list; it is off by default. Allowed requires an explicit ALLOW/ACCEPT log. GeoIP lookups stay local.')),
       this.stats,
       E('div', {class: 'fw-toolbar fw-primary-toolbar'}, [
         this.search, this.kind, this.proto, this.window, this.sort,
@@ -2674,7 +2697,7 @@ return view.extend({
       else if (type === 'port')
         this.portFilter = this.portFilter === Number(value) ? null : Number(value);
       else if (type === 'clear') {
-        this.kindFilter = 'all';
+        this.kindFilter = 'known';
         this.countryFilter = '';
         this.asnFilter = '';
         this.portFilter = null;

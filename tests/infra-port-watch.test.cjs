@@ -42,6 +42,10 @@ test('watcher only logs TCP SYN and UDP matches, then returns traffic to normal 
   assert.match(watcher, /install_log_chain "\$FWD_CHAIN" reffix_fwd 4\/minute 4/);
   assert.match(watcher, /--hashlimit-htable-expire 120000/);
   assert.match(watcher, /INFRA_PORT_FWD/);
+  assert.match(watcher, /log_other_ports/);
+  assert.match(watcher, /if \[ "\$other_ports" = 1 \]/);
+  assert.match(config, /option log_other_ports '0'/);
+  assert.match(writer, /sample-other-ports/);
   assert.match(watcher, /src_dport/);
   assert.doesNotMatch(watcher, /--limit 10\/minute --limit-burst 20/);
   assert.doesNotMatch(watcher, /\-j (?:ACCEPT|DROP|REJECT)\b/);

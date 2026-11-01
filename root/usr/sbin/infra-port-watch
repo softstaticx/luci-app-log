@@ -224,17 +224,23 @@ apply_rules() {
 	split_port_budgets
 	remove_rules
 	LOG_MODE=per-source
+	other_ports="$(uci_get "$CONFIG.log_other_ports")"
+	case "$other_ports" in 1) ;; *) other_ports=0 ;; esac
 	iptables -t raw -N "$MATCH_CHAIN" 2>/dev/null || true
 	iptables -t raw -F "$MATCH_CHAIN" || return 1
 	install_log_chain "$LOG_CHAIN" reffix_scan 30/minute 15 'INFRA_PORT_HIT: ' || return 1
 	install_log_chain "$FWD_CHAIN" reffix_fwd 4/minute 4 'INFRA_PORT_HIT: ' || return 1
-	install_log_chain "$OTHER_CHAIN" reffix_other 2/minute 5 'INFRA_PORT_OTHER: ' || return 1
+	if [ "$other_ports" = 1 ]; then
+		install_log_chain "$OTHER_CHAIN" reffix_other 2/minute 5 'INFRA_PORT_OTHER: ' || return 1
+	fi
 	mkdir -p /tmp/log-viewer
 	printf '%s\n' "$LOG_MODE" > "$RATE_NOTE"
 	[ -z "$SCAN_PORTS" ] || { install_groups tcp "$SCAN_PORTS" "$LOG_CHAIN"; install_groups udp "$SCAN_PORTS" "$LOG_CHAIN"; }
 	[ -z "$FWD_PORTS" ] || { install_groups tcp "$FWD_PORTS" "$FWD_CHAIN"; install_groups udp "$FWD_PORTS" "$FWD_CHAIN"; }
-	iptables -t raw -A "$MATCH_CHAIN" -i "$WAN_IF" -p tcp -m tcp --syn -j "$OTHER_CHAIN" || return 1
-	iptables -t raw -A "$MATCH_CHAIN" -i "$WAN_IF" -p udp -j "$OTHER_CHAIN" || return 1
+	if [ "$other_ports" = 1 ]; then
+		iptables -t raw -A "$MATCH_CHAIN" -i "$WAN_IF" -p tcp -m tcp --syn -j "$OTHER_CHAIN" || return 1
+		iptables -t raw -A "$MATCH_CHAIN" -i "$WAN_IF" -p udp -j "$OTHER_CHAIN" || return 1
+	fi
 	iptables -t raw -A "$MATCH_CHAIN" -j RETURN || return 1
 	iptables -t raw -I PREROUTING 1 -j "$MATCH_CHAIN" || return 1
 	echo "INFRA_PORT_WATCH installed on $WAN_IF"
@@ -243,6 +249,8 @@ apply_rules() {
 print_config() {
 	enabled="$(uci_get "$CONFIG.enabled")"; [ -n "$enabled" ] || enabled=1
 	wan="$(uci_get "$CONFIG.wan_interface")"; [ -n "$wan" ] || wan=auto
+	other_ports="$(uci_get "$CONFIG.log_other_ports")"
+	case "$other_ports" in 1) ;; *) other_ports=0 ;; esac
 	load_ports
 	active=""
 	if [ "$enabled" = 1 ]; then active="$(resolve_wan 2>/dev/null || true)"; fi
@@ -259,11 +267,20 @@ print_config() {
 	json_add_string router_offset "$(date +%z 2>/dev/null || echo '')"
 	json_add_boolean installed "$installed"
 	json_add_string address_family 'IPv4 only'
+	json_add_boolean log_other_ports "$other_ports"
 	rate_mode="$(cat "$RATE_NOTE" 2>/dev/null || echo per-source)"
 	if [ "$rate_mode" = shared ]; then
-		json_add_string log_rate 'shared fallback, hashlimit unavailable: 30 per minute, forwarded ports 4 per minute, other ports 2 per minute'
+		if [ "$other_ports" = 1 ]; then
+			json_add_string log_rate 'shared fallback, hashlimit unavailable: 30 per minute, forwarded ports 4 per minute, other ports 2 per minute'
+		else
+			json_add_string log_rate 'shared fallback, hashlimit unavailable: 30 per minute, forwarded ports 4 per minute; other-port sampling off'
+		fi
 	else
-		json_add_string log_rate '30 per minute per source after burst of 15; forwarded ports 4 per minute per source; other ports 2 per minute per source after burst of 5'
+		if [ "$other_ports" = 1 ]; then
+			json_add_string log_rate '30 per minute per source after burst of 15; forwarded ports 4 per minute per source; other ports 2 per minute per source after burst of 5'
+		else
+			json_add_string log_rate '30 per minute per source after burst of 15; forwarded ports 4 per minute per source; other-port sampling off'
+		fi
 	fi
 	json_add_array redirects
 	# A missing firewall config must not hide WAN watch status.

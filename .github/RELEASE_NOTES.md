@@ -1,18 +1,14 @@
-# luci-app-log v3.3.4
+# luci-app-log v3.3.5
 
 OpenWrt 25.12 release. The package name remains `luci-app-log-viewer`. IPv4 only.
 
 ## This release
 
-Click any **source IP** to open a detail drawer: all events in view, ports, first/last seen, reverse DNS, copy actions, and one-click “watch this port.” The toolbar now sorts by time, source, country, or port, and quick chips filter by verdict, country, ASN, or port.
+The WAN watch now logs **only the configured port list** by default. The low-rate sample of every other WAN port is off unless you enable **Settings → WAN watch settings → Also sample other ports**. Existing routers default to off.
 
-**Browse router history** reads the router ring and opt-in disk history in pages. Filtering, sorting, and pagination happen on the router, so large histories no longer have to fit in the browser. Enable **Persistent history settings** to write daily files to a mounted disk or USB path with a retention period and size cap; it is off by default.
+The page opens with **Known ports only** selected, so previous other-port samples no longer flood the table, chips, or insights. Choose **All verdict types** when you want to inspect them. Ports on the watch list are classified **Blocked** unless a label or allow rule applies.
 
-The background collector now streams `logread -f` and appends only new firewall lines. It no longer rescans the last 1,500 log lines every 15 seconds; the page reads the cheap status and ring instead of triggering another scan.
-
-**Update GeoIP databases** now shows download, validation, and apply phases, including the downloaded sizes, and refreshes the database age when it finishes.
-
-The installer reinstalls the same release with `apk add --force-reinstall` where available, so auto-installed dependencies such as the hashlimit modules are not removed first.
+The v3.3.4 features remain: source detail drawer, sorting and filter chips, router-side history browsing and pagination, opt-in persistent history, visible GeoIP update progress, streamed `logread -f` collection, and dependency-safe same-version reinstalls.
 
 The package depends on `iptables-mod-hashlimit`, so each source address keeps its own log budget. If the match cannot be loaded, the watch falls back to one shared limit and the status line says so.
 

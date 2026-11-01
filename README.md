@@ -22,13 +22,13 @@ Manual install: download both APKs and `SHA256SUMS-openwrt-25.12.txt` from [Rele
 
 ## Using it
 
-**Blocked** is a known-port probe with nothing allowing it. The firewall's default policy drops it later. **Other** is a low-rate sample of every other WAN port. **Exposed** means that port has a label or a firewall forward. **Allowed** requires an explicit accept log.
+**Blocked** is a known-port probe with nothing allowing it. The firewall's default policy drops it later. **Other** is an optional low-rate sample of every other WAN port; it is off by default. **Exposed** means that port has a label or a firewall forward. **Allowed** requires an explicit accept log. The page starts with **Known ports only** selected, so old other-port samples do not flood the table.
 
-Each source gets its own budget: 30 per minute on a known port, 4 per minute when that port is also forwarded, 2 per minute on anything else. The package depends on `iptables-mod-hashlimit`. The watch only logs IPv4 TCP SYN and UDP, then returns the packet.
+Each source gets its own budget: 30 per minute on a known port and 4 per minute when that port is also forwarded. If **Also sample other ports** is enabled, those use 2 per minute. The package depends on `iptables-mod-hashlimit`. The watch only logs IPv4 TCP SYN and UDP, then returns the packet.
 
-**Details** on an Other row can add that port to the known list. Click any **source IP** to open the source drawer: all events in view, ports, first/last seen, reverse DNS, copy actions, and one-click “watch this port.” The toolbar sorts by time, source, country, or port, and the chips filter by verdict, country, ASN, or port.
+**Details** on an Other row can add that port to the known list when sampling is enabled. Click any **source IP** to open the source drawer: events in view, ports, first/last seen, reverse DNS, copy actions, and one-click “watch this port.” The toolbar sorts by time, source, country, or port, and the chips filter by verdict, country, ASN, or port.
 
-**Settings → WAN watch settings → Add missing default ports** fills in shipped defaults that a saved list does not have. **Settings → Files → Update GeoIP databases** downloads, validates, and applies the Country and ASN databases with visible progress. They are not in the APK. Review the [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula) before sharing them.
+**Settings → WAN watch settings** controls **Also sample other ports** (off by default) and **Add missing default ports**. **Settings → Files → Update GeoIP databases** downloads, validates, and applies the Country and ASN databases with visible progress. They are not in the APK. Review the [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula) before sharing them.
 
 Browser history is optional. The router keeps 500 firewall lines in memory at `/tmp/log-viewer/events.ring`, cleared on reboot. For a longer history, enable **Persistent history settings** under Settings → History and point it at a mounted disk or USB path. **Browse router history** pages and filters that stored history on the router, so large histories stay out of the browser memory.
 
