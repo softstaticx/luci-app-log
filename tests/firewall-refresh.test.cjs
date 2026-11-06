@@ -131,6 +131,32 @@ test('the table is readable, responsive and honest about verdicts', () => {
   assert.match(css, /\.fw-badge\.probe/);
 });
 
+test('a missing GeoIP database is shown as off, not as a silent blank', () => {
+  assert.match(source, /fw-geo-banner/);
+  assert.match(source, /this\.geoBanner\.hidden = available/);
+  assert.match(source, /GeoIP is off: no local databases are installed/);
+  assert.match(source, /GeoIP off · no local databases/);
+  assert.match(source, /_\('GeoIP off'\)/);
+  assert.match(source, /GeoIP lookups are failing: /);
+  assert.match(css, /\.fw-geo-banner/);
+});
+
+test('a successful database update clears cached misses and fills the table', () => {
+  assert.match(source, /this\.geoCache = \{\};/);
+  assert.match(source, /this\.geoCacheAt = \{\};/);
+  assert.match(source, /this\.geoLookupError = '';/);
+  const update = source.slice(source.indexOf('updateGeoDatabases: async function'), source.indexOf('getTimeWindowMs: function'));
+  assert.match(update, /this\.enrichAndRender\(\);/);
+  assert.match(update, /status\.state === 'error'/);
+  assert.match(update, /databases are still unavailable/);
+});
+
+test('the lookup wrapper falls back to mmdblookup when the helper is broken', () => {
+  const wrapper = fs.readFileSync(path.join(__dirname, '../root/usr/bin/flint4-geoip'), 'utf8');
+  assert.ok(wrapper.includes('helper_out="$("$HELPER" --db "$DB_DIR" --batch "$@"'));
+  assert.ok(wrapper.includes('if [ -n "$helper_out" ]'));
+  assert.ok(wrapper.includes('for ip in "$@"; do'));
+});
 test('the page inherits the LuCI theme instead of shipping its own palette', () => {
   assert.match(source, /L\.resource\('log-viewer\/firewall\.css'\)/);
   assert.doesNotMatch(source, /--mp-bg/, 'the hard-coded palette must be gone');

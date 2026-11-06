@@ -1023,3 +1023,24 @@
 	.fw-shell .fw-event-details { display: none !important; }
 	.fw-shell .fw-tablewrap { max-height: none; overflow: visible; }
 }
+
+/* -------------------------------------------------------------- geo banner */
+
+.fw-shell .fw-geo-banner {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+	align-items: center;
+	justify-content: space-between;
+	margin: 10px 0 4px;
+	padding: 10px 12px;
+	color: var(--fw-text);
+	background: color-mix(in srgb, #b45309 14%, transparent);
+	border: 1px solid color-mix(in srgb, #b45309 45%, transparent);
+	border-radius: 9px;
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+.fw-shell .fw-geo-banner[hidden] { display: none !important; }
+.fw-shell .fw-geo-banner span { flex: 1 1 320px; }

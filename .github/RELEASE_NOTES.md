@@ -1,34 +1,43 @@
-# luci-app-log v4.0.1
+# luci-app-log v4.0.2
 
 OpenWrt 25.12 patch release. The package name remains `luci-app-log-viewer`.
 
 ## Why this release exists
 
-On a default 4.0.0 install the GeoIP update did not work: the updater exited
-before downloading anything, and the page still said "Applied. Databases are
-ready." There were two causes and one misleading symptom.
-
-- The updater's UCI loader ended with `[ -n "$v" ] && VAR="$v"`. The shipped
-  `sha256_country` and `sha256_asn` options are empty, so the function returned
-  1 and `set -e` ended the script silently.
-- The lock line used `exec 9>"$LOCK" 2>/dev/null`. A redirection-only `exec`
-  applies its redirections to the whole shell, so every later error message was
-  written to `/dev/null`.
-- cgi-io always answers `200 OK` for `cgi-exec`, even when the command fails.
-  The page trusted the resolved promise, so failures looked like success.
+After 4.0.1 the updater works, but the page could still show **GeoIP unavailable**
+on every row while one old row kept its country. That happens when the native
+lookup helper produces no output: the wrapper used to `exec` it, so a broken or
+missing helper turned every address into a silent miss, and the page could not
+tell "no data" from "GeoIP is not set up".
 
 ## What changed
 
-- GeoIP update works again on a fresh install, with the empty checksum options
-  that ship by default.
-- Failed updates now say why: the modal shows the updater's message and output,
-  and the installer prints it too.
-- Settings saves, history changes, clearing history and **Re-apply rules** now
-  verify what the router actually returned instead of assuming success.
-- `flint4-geoip` and the 3.x history migration no longer abort when an optional
-  UCI value is missing.
-- The shell test suite executes the updater for real: empty options, failed
-  download, checksum mismatch, and a router without a `geoip` section.
+- The wrapper now captures the helper's output and falls back to `mmdblookup(1)`
+  for the batch when it is empty. A broken helper costs speed, not data.
+- No databases installed? The page says **GeoIP off** and shows a banner with an
+  **Update GeoIP databases** button, instead of leaving every row blank.
+- Failing lookups are reported once with the real reason instead of being cached
+  as empty.
+- A successful update clears the empty cache and fills the table immediately.
+
+## If you still see GeoIP off
+
+1. Upgrade to 4.0.2.
+2. **Settings → Files → Update GeoIP databases** (or the banner button).
+3. If it reports a failure, the dialog now shows the reason, and the same text is
+   in `/tmp/log-viewer/geoip-update.status`.
+
+Quick check from a shell:
+
+```sh
+/usr/bin/flint4-geoip --status
+/usr/bin/flint4-geoip --batch 8.8.8.8
+ls -l /usr/share/GeoIP
+```
+
+`--status` must report `"available":true` and the batch must return a line with
+a `country_code`. If the batch is empty, `mmdblookup` is missing
+(`apk add libmaxminddb`) or the databases are absent (run the update).
 
 ## Upgrading
 
@@ -36,25 +45,6 @@ ready." There were two causes and one misleading symptom.
 uclient-fetch -qO- https://raw.githubusercontent.com/softstaticx/luci-app-log/main/install-online.sh | sh
 ```
 
-or:
-
-```sh
-apk add --upgrade ./reffix-luci-app-log-viewer-openwrt-25.12.apk
-```
-
 No configuration changes. Settings, ports, WAN zone and history are preserved.
-
-## After upgrading
-
-Open **Status → Firewall Log → Settings → Files → Update GeoIP databases**.
-It should now complete and show the database sizes. If it still fails, the
-dialog shows the updater's own error instead of a false success; the same text
-is in `/tmp/log-viewer/geoip-update.status`.
-
-If `mmdblookup` is missing, install it first:
-
-```sh
-apk add libmaxminddb
-```
 
 GeoLite2 databases are not in the APK. See the README for the MaxMind EULA.

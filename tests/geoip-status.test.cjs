@@ -40,6 +40,7 @@ test('the page streams GeoIP answers as newline-delimited JSON', () => {
 test('the packaged helper is documented as falling back to the shell implementation', () => {
   const script = fs.readFileSync(path.join(__dirname, '../root/usr/bin/flint4-geoip'), 'utf8');
   assert.match(script, /\/usr\/libexec\/log-viewer-geoip/);
-  assert.match(script, /exec "\$HELPER" --db "\$DB_DIR" --batch/);
+  assert.ok(script.includes('helper_out="$("$HELPER" --db "$DB_DIR" --batch "$@"'));
+  assert.ok(script.includes('for ip in "$@"; do'));
   assert.match(script, /log-viewer\.geoip\.directory/);
 });

@@ -1,5 +1,27 @@
 # Changelog
 
+## v4.0.2 (2026-11-06)
+
+### GeoIP
+
+- The lookup wrapper no longer `exec`s the native helper blindly. It captures
+  the helper's output and falls back to `mmdblookup(1)` when the helper produces
+  nothing, so a broken or missing `/usr/libexec/log-viewer-geoip` no longer turns
+  every lookup into a silent miss.
+- The page now says **GeoIP off** and shows a banner with an update button when
+  no databases are installed, instead of printing "unavailable" on every row.
+- Lookup failures are reported once with the actual reason ("no database",
+  "invalid ip", …) instead of being cached as empty results.
+- After a successful update the miss cache is cleared and the table is enriched
+  immediately; previously it kept empty entries for up to five minutes and only
+  refreshed on the next tick.
+
+### Tests
+
+- New CI job compiles the helper against the real libmaxminddb, downloads
+  MaxMind's public test databases, and asserts that `2.125.160.216` resolves to
+  `GB`, both through the native helper and through the `mmdblookup` fallback.
+
 ## v4.0.1 (2026-11-06)
 
 GeoIP updates were broken on a default 4.0.0 install. Two shell bugs made the

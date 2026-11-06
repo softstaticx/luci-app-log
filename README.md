@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/softstaticx/luci-app-log/releases/latest"><img alt="Release" src="https://img.shields.io/badge/release-v4.0.1-22d3ee?style=flat-square"></a>
+  <a href="https://github.com/softstaticx/luci-app-log/releases/latest"><img alt="Release" src="https://img.shields.io/badge/release-v4.0.2-22d3ee?style=flat-square"></a>
   <img alt="OpenWrt" src="https://img.shields.io/badge/OpenWrt-25.12-00b5e2?style=flat-square">
   <img alt="Package" src="https://img.shields.io/badge/package-apk-0ea5e9?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-34d399?style=flat-square">
@@ -91,9 +91,9 @@ databases. Then open **Status → Firewall Log** and log in again if the menu en
 Download from [Releases](https://github.com/softstaticx/luci-app-log/releases):
 
 ```sh
-wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.1/reffix-luci-app-log-viewer-openwrt-25.12.apk
-wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.1/reffix-libmaxminddb-openwrt-25.12.apk
-wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.1/SHA256SUMS-openwrt-25.12.txt
+wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.2/reffix-luci-app-log-viewer-openwrt-25.12.apk
+wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.2/reffix-libmaxminddb-openwrt-25.12.apk
+wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.2/SHA256SUMS-openwrt-25.12.txt
 sha256sum -c SHA256SUMS-openwrt-25.12.txt
 apk add --allow-untrusted ./reffix-libmaxminddb-openwrt-25.12.apk ./reffix-luci-app-log-viewer-openwrt-25.12.apk
 /usr/bin/flint4-geoip-update

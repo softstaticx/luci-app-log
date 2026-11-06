@@ -1507,11 +1507,18 @@ return view.extend({
       if (!this.geoStatus || !this.geoStatus.available)
         throw new Error(_('The update finished, but the databases are still unavailable.'));
       finished = true;
+      // Addresses that missed before the update are cached as empty for five
+      // minutes; drop those entries and resolve them against the new files.
+      this.geoCache = {};
+      this.geoCacheAt = {};
+      this.geoLookupError = '';
+      this.geoErrorNotified = false;
       const sizes = [];
       if (status.country_bytes) sizes.push(_('Country ') + formatBytes(status.country_bytes));
       if (status.asn_bytes) sizes.push(_('ASN ') + formatBytes(status.asn_bytes));
       stateLine.textContent = _('Applied. Databases are ready.');
       detail.textContent = sizes.join(' · ') || String(output || '').trim();
+      this.enrichAndRender();
     }
     catch (e) {
       finished = true;
@@ -1589,7 +1596,7 @@ return view.extend({
 
     const topSources = renderList(top(sources, 'source', 5), item => {
       const geo = this.geoCache[item.source] || {};
-      const label = geo.country_name || 'GeoIP pending';
+      const label = geo.country_name || (this.geoStatus && this.geoStatus.available === false ? _('GeoIP off') : _('GeoIP pending'));
       const countryCode = (geo.country_code || '').toUpperCase();
       const asn = geo.asn_organization ? ' · ' + geo.asn_organization : '';
       const firstSeen = item.firstMs ? new Date(item.firstMs).toLocaleString() : item.first;
@@ -1608,7 +1615,9 @@ return view.extend({
     const topAsns = renderList(top(asns, 'name', 5), item =>
       '<li><strong>' + esc(item.name) + '</strong><span>' + item.count + ' events</span>' +
       '<small>' + item.sources.size + ' source IPs · based on local GeoIP matches</small></li>',
-      'No ASN data yet. GeoIP enrichment currently checks up to 60 unique recent sources.');
+      this.geoStatus && this.geoStatus.available === false
+        ? _('GeoIP is off; update the databases in Settings → Files.')
+        : _('No ASN data yet. GeoIP enrichment checks up to 60 unique recent sources.'));
 
     const timelineEvents = events.filter(event => Number.isFinite(event.timestampMs));
     const latestTime = this.routerNowMs();
@@ -1659,7 +1668,7 @@ return view.extend({
 
     const scanHtml = renderList(signals, item => {
       const geo = this.geoCache[item.source] || {};
-      const country = geo.country_name || 'GeoIP pending';
+      const country = geo.country_name || (this.geoStatus && this.geoStatus.available === false ? _('GeoIP off') : _('GeoIP pending'));
       const countryCode = (geo.country_code || '').toUpperCase();
       const details = item.ports.size + ' ports · ' + item.destinations.size + ' targets · ' +
         item.count + ' events';
@@ -1696,6 +1705,7 @@ return view.extend({
   enrich: async function(events) {
     const addresses = [...new Set(events.map(e => e.source).filter(isPublic))].slice(0, 60);
     const pending = [];
+    let lookupError = '';
     addresses.forEach(ip => {
       const known = this.geoMemory[ip];
       if (known && (known.country_code || known.country_name || known.asn_organization)) {
@@ -1731,11 +1741,21 @@ return view.extend({
         }
         chunk.forEach(ip => {
           const row = byIp.get(ip);
+          if (row && row.error) lookupError = String(row.error);
           this.rememberGeo(ip, row && !row.error ? row : {});
         });
       }
       catch (e) {
+        lookupError = e.message || String(e);
         chunk.forEach(ip => this.rememberGeo(ip, {}));
+      }
+    }
+    if (lookupError && lookupError !== this.geoLookupError) {
+      this.geoLookupError = lookupError;
+      this.renderGeoStatus();
+      if (!this.geoErrorNotified) {
+        this.geoErrorNotified = true;
+        ui.addNotification(null, E('p', _('GeoIP lookups are failing: ') + lookupError), 'warning');
       }
     }
   },
@@ -1975,7 +1995,7 @@ return view.extend({
   renderEventRow: function(e) {
     const geo = this.geoCache[e.source] || {};
     const countryCode = (geo.country_code || '').toUpperCase();
-    const country = geo.country_name || _('GeoIP unavailable');
+    const country = geo.country_name || (this.geoStatus && this.geoStatus.available === false ? _('GeoIP off') : _('GeoIP unavailable'));
     const asn = geo.asn_organization || '';
     const kindClass = e.kind === 'Blocked' ? 'blocked' :
       (e.kind === 'Probe' ? 'probe' :
@@ -2011,13 +2031,16 @@ return view.extend({
 
   renderGeoStatus: function() {
     if (!this.geoStatusText) return;
-    if (!this.geoStatus || !this.geoStatus.available) {
-      this.geoStatusText.textContent = _('GeoIP unavailable · country and ASN details hidden');
+    const available = !!(this.geoStatus && this.geoStatus.available);
+    if (this.geoBanner) this.geoBanner.hidden = available;
+    const failure = this.geoLookupError ? ' · ' + _('lookup failed: ') + this.geoLookupError : '';
+    if (!available) {
+      this.geoStatusText.textContent = _('GeoIP off · no local databases') + failure;
       return;
     }
     const age = this.geoStatus.age_days == null ? _('age unknown') : this.geoStatus.age_days + _(' days old');
     this.geoStatusText.textContent = _('Local GeoIP databases · oldest ') + age +
-      (this.geoStatus.stale ? _(' · update recommended') : '');
+      (this.geoStatus.stale ? _(' · update recommended') : '') + failure;
   },
 
   renderRows: function() {
@@ -2295,6 +2318,12 @@ return view.extend({
           E('p', {class: 'fw-description'}, _('Blocked WAN traffic as the firewall actually decided it, with local GeoIP enrichment. Probes are listed separately and marked unverified. Nothing leaves the router.'))
         ])
       ]),
+      (this.geoBanner = E('div', {class: 'fw-geo-banner', hidden: true, role: 'status'}, [
+        E('span', {}, _('GeoIP is off: no local databases are installed, so country and ASN stay empty.')),
+        E('button', {class: 'cbi-button cbi-button-action', type: 'button', click: () => {
+          this.updateGeoDatabases().catch(e => ui.addNotification(null, E('p', e.message || e), 'error'));
+        }}, _('Update GeoIP databases'))
+      ])),
       this.stats,
       E('div', {class: 'fw-toolbar fw-primary-toolbar'}, [
         this.search, this.kind, this.proto, this.window, this.sort,

@@ -61,6 +61,11 @@ jobs:
           sudo apt-get install -y -qq libmaxminddb-dev
           cc -fsyntax-only -Wall -Wextra src/log-viewer-geoip.c
 
+      - name: GeoIP helper end-to-end
+        run: |
+          sudo apt-get install -y -qq mmdb-bin
+          sh tests/geoip-e2e.sh
+
       - name: nftables rulesets parse
         run: |
           sudo apt-get install -y -qq nftables
