@@ -182,7 +182,12 @@ check "the new zone include exists" file_exists "$env_dir/include/chain-post/inp
 group "watch: configuration writer validates and stores settings"
 new_env config
 sh "$ROOT/root/usr/sbin/infra-port-watch-config" set 1 verdict wan eth2 1 0 "22,80" > "$env_dir/data/out" 2>&1
-check "valid settings are accepted" equals "$?" "0"
+writer_status=$?
+if [ "$writer_status" -ne 0 ]; then
+  printf 'writer exited %s\n' "$writer_status"
+  sed -n '1,20p' "$env_dir/data/out"
+fi
+check "valid settings are accepted" equals "$writer_status" "0"
 check "writer stores the mode" has "$env_dir/uci" "infra-port-watch.main.mode=verdict"
 check "writer stores the zone" has "$env_dir/uci" "infra-port-watch.main.wan_zone=wan"
 check "writer stores IPv6" has "$env_dir/uci" "infra-port-watch.main.ipv6=1"
