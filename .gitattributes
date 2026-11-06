@@ -1,0 +1,14 @@
+# Normalise line endings for everyone. The router executes these files with
+# /bin/sh, and a CRLF shebang breaks every script in this package.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.cjs   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.uc    text eol=lf
+Makefile text eol=lf
+VERSION  text eol=lf
+*.svg   text eol=lf
+*.png   binary
+*.md    text eol=lf

@@ -29,10 +29,18 @@ test('classifies explicit blocked events and retains original packet data', () =
   assert.equal(event.rawLine.includes('FIREWALL_BLOCK'), true);
 });
 
-test('classifies infrastructure WAN watchlist hits as blocked', () => {
+test('a probe without an observed verdict is not presented as blocked', () => {
   const event = parser('Oct 12 12:00:01 2026 router kernel: INFRA_PORT_HIT: IN=wan SRC=203.0.113.8 DST=192.0.2.1 PROTO=UDP DPT=443', 2);
-  assert.equal(event.kind, 'Blocked');
+  assert.equal(event.kind, 'Probe');
   assert.equal(event.prefix, 'INFRA_PORT_HIT');
+  assert.equal(event.verdictKnown, false);
+});
+
+test('a chain-post drop is a confirmed verdict', () => {
+  const event = parser('Oct 12 12:00:01 2026 router kernel: INFRA_PORT_BLOCK: IN=wan SRC=203.0.113.8 DST=192.0.2.1 PROTO=UDP DPT=443', 2);
+  assert.equal(event.kind, 'Blocked');
+  assert.equal(event.prefix, 'INFRA_PORT_BLOCK');
+  assert.equal(event.verdictKnown, true);
 });
 
 test('classifies a port outside the watch list as its own verdict', () => {

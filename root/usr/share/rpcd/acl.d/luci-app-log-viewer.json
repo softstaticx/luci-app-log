@@ -1,6 +1,6 @@
 {
   "luci-app-log-viewer": {
-    "description": "Grant access to firewall log procedures",
+    "description": "Firewall Log: view blocked and probed WAN traffic, router history, and local GeoIP status",
     "read": {
       "cgi-io": [
         "exec"
@@ -24,13 +24,10 @@
         "/usr/libexec/logread-ubox*": [
           "exec"
         ],
-        "/usr/bin/flint4-geoip": [
-          "exec"
-        ],
         "/usr/sbin/infra-port-watch get": [
           "exec"
         ],
-        "/usr/sbin/log-viewer-history": [
+        "/usr/sbin/log-viewer-history status": [
           "exec"
         ],
         "/usr/sbin/log-viewer-query": [
@@ -39,20 +36,26 @@
         "/usr/sbin/log-viewer-ip": [
           "exec"
         ],
+        "/usr/bin/flint4-geoip": [
+          "exec"
+        ],
         "/tmp/log-viewer/events.status": [
           "read"
         ],
         "/tmp/log-viewer/geoip-update.status": [
           "read"
         ],
-        "/etc/log-viewer/policies.json": [
+        "/tmp/log-viewer/events.ring": [
           "read"
         ],
-        "/tmp/log-viewer/events.ring": [
+        "/etc/log-viewer/policies.json": [
           "read"
         ]
       }
-    },
+    }
+  },
+  "luci-app-log-viewer-admin": {
+    "description": "Firewall Log: change watch settings, history retention, and GeoIP databases",
     "write": {
       "ubus": {
         "file": [
@@ -63,7 +66,13 @@
         "/usr/sbin/infra-port-watch-config": [
           "exec"
         ],
-        "/usr/sbin/log-viewer-history": [
+        "/usr/sbin/infra-port-watch": [
+          "exec"
+        ],
+        "/usr/sbin/log-viewer-history configure": [
+          "exec"
+        ],
+        "/usr/sbin/log-viewer-history clear": [
           "exec"
         ],
         "/usr/bin/flint4-geoip-update": [

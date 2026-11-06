@@ -4,6 +4,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '../htdocs/luci-static/resources/view/log-viewer/firewall.js'), 'utf8');
+const css = fs.readFileSync(path.join(__dirname, '../htdocs/luci-static/resources/log-viewer/firewall.css'), 'utf8');
 
 function extract(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -59,6 +60,42 @@ test('watch status stays fresh for a minute instead of reloading on every live t
   assert.doesNotMatch(refresh, /loadWatchConfig\(true\)/);
 });
 
+test('search tokens are parsed, validated and degraded to free text', () => {
+  const parseQuery = extract('parseQuery');
+  assert.deepEqual(parseQuery('22 jellyfin'), {
+    words: ['22', 'jellyfin'], port: null, country: '', asn: '', proto: '', verdict: '', source: '', afterMs: 0
+  });
+  const query = parseQuery('port:22 country:cn verdict:blocked proto:udp src:203.0.113.9 after:1h asn:telekom');
+  assert.equal(query.port, 22);
+  assert.equal(query.country, 'CN');
+  assert.equal(query.verdict, 'blocked');
+  assert.equal(query.proto, 'udp');
+  assert.equal(query.source, '203.0.113.9');
+  assert.equal(query.afterMs, 3600000);
+  assert.equal(query.asn, 'telekom');
+  assert.deepEqual(query.words, []);
+  const invalid = parseQuery('port:99999 country:zzz verdict:nope proto:sctp after:9h');
+  assert.equal(invalid.port, null);
+  assert.equal(invalid.country, '');
+  assert.equal(invalid.verdict, '');
+  assert.equal(invalid.proto, '');
+  assert.equal(invalid.afterMs, 0);
+  assert.deepEqual(invalid.words, ['port:99999', 'country:zzz', 'verdict:nope', 'proto:sctp', 'after:9h']);
+  assert.equal(extract('queryIsEmpty')(parseQuery('')), true);
+  assert.equal(extract('queryIsEmpty')(parseQuery('port:22')), false);
+});
+
+test('filters are mirrored into the URL so a view can be shared', () => {
+  assert.match(source, /loadUrlState: function/);
+  assert.match(source, /saveUrlState: function/);
+  assert.match(source, /new URLSearchParams\(location\.search\)/);
+  assert.match(source, /history\.replaceState/);
+  assert.match(source, /this\.saveUrlState\(\)/);
+  assert.match(source, /Copy view link/);
+  assert.match(source, /params\.get\(key\)/);
+  assert.match(source, /params\.get\('q'\)/);
+});
+
 test('an insight filter describes itself and settings are grouped by job', () => {
   const insightFilterText = extract('insightFilterText');
   assert.equal(insightFilterText('', null, null), '');
@@ -71,34 +108,37 @@ test('an insight filter describes itself and settings are grouped by job', () =>
   assert.match(source, /fw-settings-history/);
   assert.match(source, /fw-settings-files/);
   assert.match(source, /handleSaveApply: null/);
-  assert.match(source, /Default deny/);
-  assert.match(source, /Not on the watch list/);
+  assert.match(source, /Confirmed drops only/);
+  assert.match(source, /value: 'probe'/);
+  assert.match(source, /verdictKnown/);
   assert.match(source, /value: 'other'/);
   assert.doesNotMatch(source, /WAN watchlist/);
   assert.match(source, /fw-primary-toolbar[\s\S]{0,500}this\.presets/);
   assert.doesNotMatch(source, /_\('Clear insight filters'\)/);
 });
 
-test('the log type is one step smaller and an Other row can join the known list', () => {
-  const appendWatchPort = extract('appendWatchPort');
-  assert.deepEqual(appendWatchPort('22,80', 443), {ok: true, changed: true, ports: '22,80,443'});
-  assert.deepEqual(appendWatchPort('22, 80', 22), {ok: true, changed: false, ports: '22,80'});
-  assert.deepEqual(appendWatchPort('', 25125), {ok: true, changed: true, ports: '25125'});
-  assert.equal(appendWatchPort('22', 0).ok, false);
-  assert.equal(appendWatchPort('22', 65536).ok, false);
-  const full = Array.from({length: 256}, (_, i) => i + 1).join(',');
-  assert.deepEqual(appendWatchPort(full, 700), {ok: false, reason: 'full'});
-  assert.equal(appendWatchPort(full, 22).changed, false);
-
-  assert.match(source, /position: sticky/);
-  assert.match(source, /\.fw-table thead th \{[\s\S]*background: #403A42 !important/);
-  assert.match(source, /\.fw-shell \.fw-table \{ min-width: 960px; font-size: 13px !important; \}/);
-  assert.match(source, /\.fw-shell \.fw-stat strong \{ font-size: 22px !important; \}/);
-  assert.match(source, /\.fw-primary-toolbar input,\n      \.fw-shell \.fw-primary-toolbar select \{ min-height: 36px; font-size: 13px !important; \}/);
-  assert.doesNotMatch(source, /font-size: 15px/);
-  assert.doesNotMatch(source, /font-size: 28px/);
+test('the table is readable, responsive and honest about verdicts', () => {
+  assert.match(source, /data-label=/);
+  assert.match(source, /fw-' \+ kindClass/);
+  assert.match(source, /e\.kind === 'Probe'/);
   assert.match(source, /Log this port at the full budget/);
   assert.match(source, /event\.kind === 'Other'/);
+  assert.match(css, /\.fw-table[\s\S]*min-width: 960px/);
+  assert.match(css, /font-size: 13px/);
+  assert.match(css, /\.fw-stat strong[\s\S]*font-size: 22px/);
+  assert.match(css, /@media \(max-width: 760px\)[\s\S]*data-label|@media \(max-width: 760px\)[\s\S]*attr\(data-label\)/);
+  assert.match(css, /\.fw-table td::before/);
+  assert.match(css, /\.fw-badge\.probe/);
+});
+
+test('the page inherits the LuCI theme instead of shipping its own palette', () => {
+  assert.match(source, /L\.resource\('log-viewer\/firewall\.css'\)/);
+  assert.doesNotMatch(source, /--mp-bg/, 'the hard-coded palette must be gone');
+  assert.match(css, /var\(--background-color-high, Canvas\)/);
+  assert.match(css, /var\(--text-color-high, CanvasText\)/);
+  assert.match(css, /prefers-color-scheme|CanvasText/);
+  assert.match(css, /@media \(prefers-reduced-motion/);
+  assert.match(css, /@media print/);
 });
 
 test('missing default ports are appended and GeoIP can be refreshed from settings', () => {
@@ -128,6 +168,8 @@ test('missing default ports are appended and GeoIP can be refreshed from setting
 test('server history, sorting, chips and the source drawer are wired', () => {
   assert.match(source, /openServerHistory/);
   assert.match(source, /log-viewer-query/);
+  assert.match(source, /--days/);
+  assert.match(source, /sorted the most recent 2,000 matches/);
   assert.match(source, /log-viewer-history', \[\s*'configure'/);
   assert.match(source, /openIpDrawer/);
   assert.match(source, /log-viewer-ip/);
@@ -155,7 +197,7 @@ test('modals use the LuCI 25.12 showModal signature and keep actions in content'
   assert.match(source, /fw-watch-status/);
   assert.match(source, /this\.eventById = new Map/);
   assert.match(source, /this\.eventById\.get/);
-  assert.doesNotMatch(source, /_\('Edit WAN watch'\)/);
+  assert.doesNotMatch(source, /_\('Edit WAN watch'/);
   assert.match(source, /_\('WAN watch settings'\)/);
 });
 
@@ -182,5 +224,4 @@ test('empty or malformed watch status is treated as unavailable', () => {
   assert.equal(watchInstalled(null), false);
   assert.equal(watchInstalled({installed: false}), false);
   assert.equal(watchInstalled({installed: true}), true);
-  assert.equal(watchInstalled({installed: 1}), true);
 });

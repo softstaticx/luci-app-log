@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Firewall Log">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#1f2937"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="barA" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fb7185"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <linearGradient id="barB" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <linearGradient id="barC" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4ade80"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#bg)"/>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="114.5" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+
+  <path d="M256 104 L388 150 V262 C388 338 334 392 256 416 C178 392 124 338 124 262 V150 Z"
+        fill="none" stroke="url(#shield)" stroke-width="22"
+        stroke-linejoin="round" stroke-linecap="round" filter="url(#soft)"/>
+
+  <g stroke-linecap="round">
+    <rect x="180" y="180" width="152" height="22" rx="11" fill="url(#barA)"/>
+    <rect x="180" y="228" width="120" height="22" rx="11" fill="url(#barB)"/>
+    <rect x="180" y="276" width="88" height="22" rx="11" fill="url(#barC)"/>
+  </g>
+
+  <circle cx="292" cy="287" r="11" fill="#67e8f9"/>
+</svg>

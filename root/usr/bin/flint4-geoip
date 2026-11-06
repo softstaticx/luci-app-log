@@ -1,11 +1,36 @@
 #!/bin/sh
-# Local MaxMind GeoLite2 lookup and database status. Requires libmaxminddb (mmdblookup).
+# Local MaxMind GeoLite2 lookup and database status.
+#
+# Output is newline-delimited JSON (one object per address) so the page can
+# stream large batches without building a JSON object in shell. When the
+# packaged helper /usr/libexec/log-viewer-geoip exists it performs the whole
+# batch in one process; otherwise this script falls back to mmdblookup(1).
 set -eu
-country_db="${GEOIP_DB_DIR:-/usr/share/GeoIP}/GeoLite2-Country.mmdb"
-asn_db="${GEOIP_DB_DIR:-/usr/share/GeoIP}/GeoLite2-ASN.mmdb"
+
+DB_DIR="${GEOIP_DB_DIR:-/usr/share/GeoIP}"
+HELPER="${LOG_VIEWER_GEOIP_HELPER:-/usr/libexec/log-viewer-geoip}"
+if [ -z "${GEOIP_DB_DIR:-}" ] && command -v uci >/dev/null 2>&1; then
+  v="$(uci -q get log-viewer.geoip.directory 2>/dev/null || true)"
+  [ -n "$v" ] && DB_DIR="$v"
+fi
+country_db="$DB_DIR/GeoLite2-Country.mmdb"
+asn_db="$DB_DIR/GeoLite2-ASN.mmdb"
 
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n\t'
+}
+
+valid_ip() {
+  case "$1" in
+    ''|*[!0-9a-fA-F:.]*) return 1 ;;
+  esac
+  [ "${#1}" -le 45 ] || return 1
+  return 0
+}
+
+have_mmdb() {
+  [ -s "$country_db" ] || [ -s "$asn_db" ] || return 1
+  command -v mmdblookup >/dev/null 2>&1
 }
 
 lookup_ip() {
@@ -13,75 +38,94 @@ lookup_ip() {
   cc=""
   country=""
   asn=""
-  if [ -s "$country_db" ] && command -v mmdblookup >/dev/null 2>&1; then
-    dump="$(mmdblookup --file "$country_db" --ip "$ip" country 2>/dev/null || true)"
-    cc="$(printf '%s\n' "$dump" | sed -n '/iso_code/,+2s/.*"\([A-Z][A-Z]\)".*/\1/p' | head -n1)"
-    country="$(printf '%s\n' "$dump" | awk '
-      /"en"/ { grab=1; next }
-      grab && /"/ {
-        if (match($0, /"[^"]+"/)) { print substr($0, RSTART+1, RLENGTH-2); exit }
-      }
-    ')"
-  fi
-  if [ -s "$asn_db" ] && command -v mmdblookup >/dev/null 2>&1; then
-    asn="$(mmdblookup --file "$asn_db" --ip "$ip" autonomous_system_organization 2>/dev/null | sed -n 's/.*"\(.*\)".*/\1/p' | head -n1 || true)"
+  as_name=""
+  if have_mmdb; then
+    if [ -s "$country_db" ]; then
+      dump="$(mmdblookup --file "$country_db" --ip "$ip" country 2>/dev/null || true)"
+      cc="$(printf '%s\n' "$dump" | sed -n '/iso_code/,+2s/.*"\([A-Z][A-Z]\)".*/\1/p' | head -n 1)"
+      country="$(printf '%s\n' "$dump" | awk '
+        /"en"/ { grab = 1; next }
+        grab && /"/ {
+          if (match($0, /"[^"]+"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+        }
+      ')"
+    fi
+    if [ -s "$asn_db" ]; then
+      dump="$(mmdblookup --file "$asn_db" --ip "$ip" 2>/dev/null || true)"
+      asn="$(printf '%s\n' "$dump" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\) <uint32>.*/\1/p' | head -n 1)"
+      as_name="$(printf '%s\n' "$dump" | sed -n 's/.*"\(.*\)" <utf8_string>.*/\1/p' | head -n 1)"
+    fi
   fi
 }
 
-emit_lookup() {
+emit() {
   ip="$1"
-  case "$ip" in
-    ''|*[!0-9.]*|*.*.*.*.*)
-      printf '{"error":"invalid IP"}'
-      return 0
-      ;;
-  esac
+  if ! valid_ip "$ip"; then
+    printf '{"ip":"%s","error":"invalid ip"}\n' "$(json_escape "$ip")"
+    return 0
+  fi
   lookup_ip "$ip"
-  printf '{"country_code":"%s","country_name":"%s","asn_organization":"%s"}' \
-    "$(json_escape "$cc")" "$(json_escape "$country")" "$(json_escape "$asn")"
+  printf '{"ip":"%s","country_code":"%s","country_name":"%s","asn":"%s","asn_organization":"%s"}\n' \
+    "$(json_escape "$ip")" "$(json_escape "$cc")" "$(json_escape "$country")" \
+    "$(json_escape "$asn")" "$(json_escape "$as_name")"
 }
 
-if [ "$#" -eq 1 ] && [ "$1" = "--status" ]; then
+status() {
   available=false
   age_days=null
   stale=false
-  if [ -s "$country_db" ] && [ -s "$asn_db" ] && command -v mmdblookup >/dev/null 2>&1; then
+  country_bytes=0
+  asn_bytes=0
+  if [ -s "$country_db" ]; then country_bytes="$(stat -c %s "$country_db" 2>/dev/null || echo 0)"; fi
+  if [ -s "$asn_db" ]; then asn_bytes="$(stat -c %s "$asn_db" 2>/dev/null || echo 0)"; fi
+  case "$country_bytes" in ''|*[!0-9]*) country_bytes=0 ;; esac
+  case "$asn_bytes" in ''|*[!0-9]*) asn_bytes=0 ;; esac
+  if [ -s "$country_db" ] && command -v mmdblookup >/dev/null 2>&1; then
     country_time="$(stat -c %Y "$country_db" 2>/dev/null || echo 0)"
-    asn_time="$(stat -c %Y "$asn_db" 2>/dev/null || echo 0)"
     case "$country_time" in ''|*[!0-9]*) country_time=0 ;; esac
-    case "$asn_time" in ''|*[!0-9]*) asn_time=0 ;; esac
     older_time="$country_time"
-    [ "$asn_time" -ge "$older_time" ] || older_time="$asn_time"
+    if [ -s "$asn_db" ]; then
+      asn_time="$(stat -c %Y "$asn_db" 2>/dev/null || echo 0)"
+      case "$asn_time" in ''|*[!0-9]*) asn_time=0 ;; esac
+      [ "$asn_time" -ge "$older_time" ] || older_time="$asn_time"
+    fi
     now="$(date +%s 2>/dev/null || echo 0)"
-    case "$older_time:$now" in *[!0-9:]*|:*) older_time=0 ;; esac
     if [ "$older_time" -gt 0 ] && [ "$now" -ge "$older_time" ]; then
       age_days=$(( (now - older_time) / 86400 ))
       [ "$age_days" -le 45 ] || stale=true
     fi
     available=true
   fi
-  printf '{"available":%s,"age_days":%s,"stale":%s}\n' "$available" "$age_days" "$stale"
-  exit 0
-fi
+  printf '{"available":%s,"age_days":%s,"stale":%s,"country_bytes":%s,"asn_bytes":%s,"database_dir":"%s"}\n' \
+    "$available" "$age_days" "$stale" "$country_bytes" "$asn_bytes" "$(json_escape "$DB_DIR")"
+}
 
-if [ "$#" -ge 1 ] && [ "$1" = "--batch" ]; then
-  shift
-  printf '{'
-  first=1
-  for ip in "$@"; do
-    if [ "$first" -eq 1 ]; then first=0; else printf ','; fi
-    printf '"%s":' "$(json_escape "$ip")"
-    emit_lookup "$ip"
-  done
-  printf '}\n'
-  exit 0
-fi
-
-if [ "$#" -ne 2 ] || [ "$1" != "--json" ]; then
-  echo '{"error":"usage: flint4-geoip --json IP | --batch IP [IP...] | --status"}'
-  exit 2
-fi
-ip="$2"
-case "$ip" in *[!0-9a-fA-F:.]*) echo '{"error":"invalid IP"}'; exit 2;; esac
-emit_lookup "$ip"
-printf '\n'
+case "${1:-}" in
+  --status)
+    status
+    ;;
+  --batch)
+    shift
+    if [ -x "$HELPER" ] && [ "$#" -gt 0 ]; then
+      exec "$HELPER" --db "$DB_DIR" --batch "$@"
+    fi
+    for ip in "$@"; do
+      emit "$ip"
+    done
+    ;;
+  --json)
+    shift
+    if [ "$#" -ne 1 ]; then
+      echo '{"error":"usage: flint4-geoip --json IP"}' >&2
+      exit 2
+    fi
+    if [ -x "$HELPER" ]; then
+      exec "$HELPER" --db "$DB_DIR" --json "$1"
+    fi
+    emit "$1"
+    ;;
+  *)
+    echo 'usage: flint4-geoip --json IP | --batch IP [IP...] | --status' >&2
+    exit 2
+    ;;
+esac

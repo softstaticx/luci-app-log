@@ -13,23 +13,56 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
       - name: JavaScript syntax
         run: node --check htdocs/luci-static/resources/view/log-viewer/firewall.js
-      - name: Firewall parser and installer checksum behavior
-        run: node --test tests/*.test.cjs
+
+      - name: Unit tests
+        run: node --test tests/
+
+      - name: Shell integration tests
+        run: sh tests/shell-tests.sh
+
       - name: Shell syntax
         run: |
-          sh -n install.sh
-          sh -n install-online.sh
-          sh -n uninstall.sh
-          sh -n root/usr/bin/flint4-geoip
-          sh -n root/usr/bin/flint4-geoip-update
-          sh -n root/usr/sbin/infra-port-watch
-          sh -n root/usr/sbin/infra-port-watch-config
-          sh -n root/etc/init.d/infra-port-watch
-          sh -n root/etc/infra-port-watch.sh
-          sh -n root/etc/hotplug.d/iface/99-infra-port-watch
+          set -eu
+          for f in install.sh install-online.sh uninstall.sh \
+                   root/usr/bin/* root/usr/sbin/* root/etc/init.d/* \
+                   root/etc/hotplug.d/iface/* root/etc/infra-port-watch.sh \
+                   tests/shell-tests.sh tests/nft-parse.sh tests/support/*; do
+            [ -f "$f" ] || continue
+            head -n 1 "$f" | grep -q '^#!' || continue
+            dash -n "$f"
+          done
+
+      - name: ShellCheck
+        run: |
+          shellcheck -s sh -S warning \
+            install.sh install-online.sh uninstall.sh \
+            root/usr/bin/* root/usr/sbin/* \
+            root/etc/hotplug.d/iface/* root/etc/infra-port-watch.sh \
+            tests/shell-tests.sh tests/nft-parse.sh tests/support/*
+          # OpenWrt init scripts use a two-word shebang and export START/STOP
+          # for /etc/rc.common, so those two checks do not apply.
+          shellcheck -s sh -S warning -e SC2096 root/etc/init.d/*
+
       - name: JSON syntax
         run: |
-          python3 -m json.tool root/usr/share/luci/menu.d/luci-app-log-viewer.json >/dev/null
-          python3 -m json.tool root/usr/share/rpcd/acl.d/luci-app-log-viewer.json >/dev/null
+          for f in root/usr/share/luci/menu.d/luci-app-log-viewer.json \
+                   root/usr/share/rpcd/acl.d/luci-app-log-viewer.json \
+                   root/usr/share/log-viewer/policies.example.json \
+                   root/etc/log-viewer/policies.json; do
+            python3 -m json.tool "$f" >/dev/null
+          done
+
+      - name: C helper compiles against libmaxminddb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libmaxminddb-dev
+          cc -fsyntax-only -Wall -Wextra src/log-viewer-geoip.c
+
+      - name: nftables rulesets parse
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y -qq nftables
+          sh tests/nft-parse.sh

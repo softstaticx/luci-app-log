@@ -5,11 +5,16 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const test = require('node:test');
 
+const gitUsr = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'usr', 'bin');
+const shell = process.platform === 'win32' ? path.join(gitUsr, 'sh.exe') : 'sh';
+const shellAvailable = process.platform !== 'win32' || fs.existsSync(shell);
+if (process.platform === 'win32') process.env.PATH = gitUsr + ';' + process.env.PATH;
+
 const installer = fs.readFileSync(path.join(__dirname, '../install-online.sh'), 'utf8');
 const match = installer.match(/^pkgver_of\(\) \{[\s\S]*?^install_downloaded_packages\(\) \{[\s\S]*?^\}/m);
 assert.ok(match, 'installer must decide install, upgrade, replace, or keep');
 
-test('a fresh router installs both packages', () => {
+test('a fresh router installs both packages', {skip: !shellAvailable}, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reffix-upgrade-'));
   try {
     const result = runPlan(root, [], '1.0.0-r1', '3.3.1-r1');
@@ -221,7 +226,7 @@ tar() {
   esac
 }
 `;
-  const out = execFileSync('sh', ['-c', `set -eu
+  const out = execFileSync(shell, ['-c', `set -eu
 APK_FORCE_REINSTALL=${forceReinstall}
 ${fake}
 ${match[0]}

@@ -2,8 +2,8 @@
 # REFFIX Log Viewer installer for OpenWrt 25.12 / APK (Flint4 / MediaTek Filogic).
 set -eu
 
-REPO=REFFIX-X/luci-app-log
-VERSION_FALLBACK=v3.3.5
+REPO=softstaticx/luci-app-log
+VERSION_FALLBACK=v4.0.0
 FAMILY=25.12
 EXT=apk
 TMP="/tmp/reffix-luci-install.$$"

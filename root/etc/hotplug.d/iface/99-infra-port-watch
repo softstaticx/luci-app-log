@@ -1,7 +1,8 @@
 #!/bin/sh
-# Re-apply the log-only WAN watch after the logical WAN comes up.
-# The init script can run at boot before PPPoE or DHCP has a device.
+# Re-apply the log-only WAN watch after the logical WAN comes up. At boot the
+# init script may run before PPPoE or DHCP has produced the WAN device, and
+# probe mode needs that device name.
 [ "${ACTION:-}" = ifup ] || exit 0
 [ "${INTERFACE:-}" = wan ] || exit 0
 [ -x /etc/init.d/infra-port-watch ] || exit 0
-/etc/init.d/infra-port-watch restart
+/etc/init.d/infra-port-watch reload

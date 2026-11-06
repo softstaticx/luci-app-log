@@ -1,0 +1,24 @@
+#!/bin/sh
+# mmdblookup(1) stand-in for the shell test suite.
+case "$*" in
+	*GeoLite2-ASN.mmdb*)
+		echo '  "autonomous_system_number":'
+		echo '    3320 <uint32>'
+		echo '  "autonomous_system_organization":'
+		echo '    "Deutsche Telekom AG" <utf8_string>'
+		exit 0
+		;;
+	*GeoLite2-Country.mmdb*)
+		cat <<'OUT'
+  "iso_code":
+    "DE" <utf8_string>
+  "names":
+    {
+      "en":
+        "Germany" <utf8_string>
+    }
+OUT
+		exit 0
+		;;
+esac
+exit 0

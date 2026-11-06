@@ -33,7 +33,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p .build-feed/luci-app-log-viewer .build-feed/libmaxminddb artifacts
-          cp -a Makefile htdocs root .build-feed/luci-app-log-viewer/
+          cp -a Makefile htdocs root src VERSION .build-feed/luci-app-log-viewer/
           cp packaging/libmaxminddb/Makefile .build-feed/libmaxminddb/Makefile
 
       - name: Build OpenWrt 25.12 APK packages

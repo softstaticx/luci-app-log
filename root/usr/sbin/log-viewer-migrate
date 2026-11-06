@@ -1,0 +1,86 @@
+#!/bin/sh
+# Upgrade migration for luci-app-log-viewer 4.x.
+#
+# Runs from postinst on every install and upgrade, so it must be idempotent.
+# It only adds missing options and moves the pre-4.0 history section, which was
+# shipped as `config history 'main'` while every reader used
+# log-viewer.history.*. Saved ports, the watch interface, and the history
+# directory are never touched.
+set -eu
+
+CONFIG=log-viewer
+WATCH=infra-port-watch
+CHANGED=0
+
+uciq() { uci -q get "$1" 2>/dev/null || true; }
+has() { uci -q get "$1" >/dev/null 2>&1; }
+changed() { CHANGED=1; }
+
+ensure_section() {
+  section="$1"
+  type="$2"
+  if ! has "$section"; then
+    uci set "$section=$type"
+    changed
+  fi
+}
+
+ensure_opt() {
+  section="$1"
+  option="$2"
+  value="$3"
+  if ! has "$section.$option"; then
+    uci set "$section.$option=$value"
+    changed
+  fi
+}
+
+# --------------------------------------------------------------- history ----
+
+if has "$CONFIG.main"; then
+  if ! has "$CONFIG.history"; then
+    uci set "$CONFIG.history=history"
+    for option in enabled directory days max_mb; do
+      value="$(uciq "$CONFIG.main.$option")"
+      [ -n "$value" ] && uci set "$CONFIG.history.$option=$value"
+    done
+    echo "migrated history section main -> history"
+  fi
+  uci -q delete "$CONFIG.main" >/dev/null 2>&1 || true
+  changed
+fi
+
+ensure_section "$CONFIG.history" history
+ensure_opt "$CONFIG.history" enabled 0
+ensure_opt "$CONFIG.history" directory /srv/log-viewer
+ensure_opt "$CONFIG.history" days 7
+ensure_opt "$CONFIG.history" max_mb 32
+ensure_opt "$CONFIG.history" ring 500
+
+# ----------------------------------------------------------------- geoip ----
+
+ensure_section "$CONFIG.geoip" geoip
+ensure_opt "$CONFIG.geoip" directory /usr/share/GeoIP
+ensure_opt "$CONFIG.geoip" url https://github.com/P3TERX/GeoLite.mmdb/raw/download
+ensure_opt "$CONFIG.geoip" sha256_country ""
+ensure_opt "$CONFIG.geoip" sha256_asn ""
+
+# ----------------------------------------------------------------- watch ----
+
+ensure_section "$WATCH.main" watch
+ensure_opt "$WATCH.main" enabled 1
+ensure_opt "$WATCH.main" mode verdict
+ensure_opt "$WATCH.main" wan_zone wan
+ensure_opt "$WATCH.main" wan_interface auto
+ensure_opt "$WATCH.main" ipv6 1
+ensure_opt "$WATCH.main" log_other_ports 0
+
+if [ "$CHANGED" = 1 ]; then
+  uci commit "$CONFIG"
+  uci commit "$WATCH"
+fi
+
+# Stale status files from 3.x describe a different collector.
+rm -f /tmp/log-viewer/events.status /tmp/log-viewer/persist.stats 2>/dev/null || true
+
+exit 0

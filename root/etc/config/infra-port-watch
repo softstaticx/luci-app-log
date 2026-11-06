@@ -1,5 +1,8 @@
 config watch 'main'
 	option enabled '1'
+	option mode 'verdict'
+	option wan_zone 'wan'
+	option ipv6 '1'
 	option wan_interface 'auto'
 	option log_other_ports '0'
 	list ports '21'

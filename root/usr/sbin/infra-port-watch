@@ -1,320 +1,498 @@
 #!/bin/sh
-# Log-only WAN port watcher. It never accepts or drops traffic.
+# shellcheck disable=SC2154
+# WAN firewall-log watcher for luci-app-log-viewer.
+#
+# Two modes:
+#
+#   verdict  Log only packets that survived the user's firewall rules and are
+#            about to hit the zone default policy. The rules are installed as
+#            fw4 chain-post includes, so fw4 itself evaluates the verdict and
+#            "blocked" is a fact rather than a guess. No iptables involved.
+#
+#   probe    Log every matching probe at raw prerouting, including traffic that
+#            will later be accepted. The verdict is not observed; the page says
+#            so. Useful for port-forward visibility.
+#
+# The watcher never accepts or drops traffic.
 set -eu
 
-# OpenWrt's /lib/functions.sh references IPKG_INSTROOT in config helpers,
-# including during normal runtime when package managers leave it unset.
-# Initialize it before sourcing that library so nounset cannot abort startup.
+# OpenWrt's /lib/functions.sh and /lib/config/uci.sh expect these globals to
+# exist, including during package upgrades where the environment is minimal.
 IPKG_INSTROOT="${IPKG_INSTROOT:-}"
-
-# /lib/config/uci.sh reads CONFIG_LIST_STATE directly while parsing a package,
-# and the config callbacks read NO_CALLBACK. Initialize the globals that the
-# stock library expects to exist so `set -u` does not abort config_load.
 CONFIG_LIST_STATE="${CONFIG_LIST_STATE:-}"
 CONFIG_SECTIONS="${CONFIG_SECTIONS:-}"
 CONFIG_NUM_SECTIONS="${CONFIG_NUM_SECTIONS:-0}"
 NO_CALLBACK="${NO_CALLBACK:-}"
 
 CONFIG=infra-port-watch.main
-MATCH_CHAIN=REFFIX_INFRA_WATCH
-LOG_CHAIN=INFRA_PORT_LOG
-FWD_CHAIN=INFRA_PORT_FWD
-OTHER_CHAIN=INFRA_PORT_OTHER
-RATE_NOTE=/tmp/log-viewer/watch-rate
-. /lib/functions.sh
-. /usr/share/libubox/jshn.sh
+TABLE=log_viewer_probe
+INCLUDE_DIR="${LOG_VIEWER_INCLUDE_DIR:-/usr/share/nftables.d}"
+RATE_KNOWN="30/minute"
+BURST_KNOWN=15
+RATE_FWD="4/minute"
+BURST_FWD=4
+RATE_OTHER="2/minute"
+BURST_OTHER=5
+
+LIBUBOX="${LOG_VIEWER_FUNCTIONS:-/lib/functions.sh}"
+FIREWALL_CONFIG="${LOG_VIEWER_FIREWALL_CONFIG:-/etc/config/firewall}"
+FW4_INIT="${LOG_VIEWER_FW4_INIT:-/etc/init.d/firewall}"
+# The library path is overridable so the test suite can use a stub.
+# shellcheck disable=SC1090
+if [ -r "$LIBUBOX" ]; then . "$LIBUBOX"; fi
 
 uci_get() { uci -q get "$1" 2>/dev/null || true; }
 
-resolve_wan() {
-	configured="$(uci_get "$CONFIG.wan_interface")"
-	[ -n "$configured" ] || configured=auto
-	if [ "$configured" = auto ]; then
-		command -v ubus >/dev/null 2>&1 || return 1
-		command -v jsonfilter >/dev/null 2>&1 || return 1
-		status="$(ubus call network.interface.wan status 2>/dev/null)"
-		configured="$(printf '%s' "$status" | jsonfilter -e '@.device' 2>/dev/null | head -n 1)"
-		[ -n "$configured" ] || configured="$(printf '%s' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null | head -n 1)"
-	fi
-	case "$configured" in
-		''|*[!a-zA-Z0-9_.:-]*) return 1 ;;
-	esac
-	printf '%s\n' "$configured"
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'
 }
 
-remove_legacy_rules() {
-	# Remove the previous script's direct PREROUTING jumps during migration.
-	legacy_groups='
-21,22,23,25,53,69,80,81,110,111
-123,135,137,138,139,143,161,162,179,389
-427,443,445,465,500,502,514,515,520,548
-554,587,631,636,873,902,989,990,993,995
-1080,1194,1433,1434,1521,1701,1723,1883,1900,2049
-2082,2083,2181,2222,2375,2376,2483,2484,3000,3128
-3268,3306,3389,3690,4444,4500,5000,5001,5060,5061
-5432,5555,5601,5672,5900,5985,5986,6379,6443,6667
-7001,7070,7443,7777,8000,8008,8080,8081,8088,8443
-8888,9000,9042,9090,9200,9300,9418,10000,11211,27017
-'
-	for iface in "$WAN_IF" eth2; do
-		for ports in $legacy_groups; do
-			while iptables -t raw -D PREROUTING -i "$iface" -p tcp -m multiport --dports "$ports" -m tcp --syn -j "$LOG_CHAIN" 2>/dev/null; do :; done
-			while iptables -t raw -D PREROUTING -i "$iface" -p udp -m multiport --dports "$ports" -j "$LOG_CHAIN" 2>/dev/null; do :; done
-		done
-	done
-}
+nft_present() { command -v nft >/dev/null 2>&1; }
 
-remove_rules() {
-	command -v iptables >/dev/null 2>&1 || return 0
-	while iptables -t raw -D PREROUTING -j "$MATCH_CHAIN" 2>/dev/null; do :; done
-	iptables -t raw -F "$MATCH_CHAIN" 2>/dev/null || true
-	iptables -t raw -X "$MATCH_CHAIN" 2>/dev/null || true
-	iptables -t raw -F "$LOG_CHAIN" 2>/dev/null || true
-	iptables -t raw -X "$LOG_CHAIN" 2>/dev/null || true
-	iptables -t raw -F "$FWD_CHAIN" 2>/dev/null || true
-	iptables -t raw -X "$FWD_CHAIN" 2>/dev/null || true
-	iptables -t raw -F "$OTHER_CHAIN" 2>/dev/null || true
-	iptables -t raw -X "$OTHER_CHAIN" 2>/dev/null || true
-}
+# ---------------------------------------------------------------- config ----
 
-remember_forward_port() {
-	port="$1"
-	case "$port" in ''|*[!0-9]*) return 0 ;; esac
-	[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 0
-	case " $FORWARD_PORTS " in *" $port "*) return 0 ;; esac
-	FORWARD_PORTS="${FORWARD_PORTS:+$FORWARD_PORTS }$port"
-}
-
-add_forward_spec() {
-	spec="$(printf '%s' "$1" | tr ',' ' ')"
-	for token in $spec; do
-		case "$token" in
-			*-*)
-				start="${token%-*}"
-				end="${token#*-}"
-				case "$start$end" in *[!0-9]*) continue ;; esac
-				[ "$end" -ge "$start" ] 2>/dev/null || continue
-				span=$((end - start + 1))
-				# A huge redirect range is not a single exposed service.
-				[ "$span" -le 64 ] || continue
-				port="$start"
-				while [ "$port" -le "$end" ]; do
-					remember_forward_port "$port"
-					port=$((port + 1))
-				done
-				;;
-			*) remember_forward_port "$token" ;;
-		esac
-	done
-}
-
-collect_forward_port() {
-	section="$1"
-	config_get forward_enabled "$section" enabled 1
-	[ "$forward_enabled" = 0 ] && return 0
-	config_get target "$section" target DNAT
-	[ "$target" = DNAT ] || return 0
-	config_get source_ports "$section" src_dport
-	[ -n "$source_ports" ] || return 0
-	add_forward_spec "$source_ports"
-}
-
-load_forward_ports() {
-	FORWARD_PORTS=""
-	CONFIG_SECTIONS="${CONFIG_SECTIONS:-}"
-	config_load firewall || return 0
-	config_foreach collect_forward_port redirect
-}
-
-split_port_budgets() {
-	SCAN_PORTS=""
-	FWD_PORTS=""
-	for port in $NORMALIZED_PORTS; do
-		case " $FORWARD_PORTS " in
-			*" $port "*) FWD_PORTS="${FWD_PORTS:+$FWD_PORTS }$port" ;;
-			*) SCAN_PORTS="${SCAN_PORTS:+$SCAN_PORTS }$port" ;;
-		esac
-	done
+load_settings() {
+  enabled="$(uci_get "$CONFIG.enabled")"
+  [ -n "$enabled" ] || enabled=1
+  case "$enabled" in 0|1) ;; *) enabled=1 ;; esac
+  mode="$(uci_get "$CONFIG.mode")"
+  case "$mode" in probe|verdict) ;; *) mode=verdict ;; esac
+  wan_zone="$(uci_get "$CONFIG.wan_zone")"
+  [ -n "$wan_zone" ] || wan_zone=wan
+  case "$wan_zone" in ''|*[!a-zA-Z0-9_]*) wan_zone=wan ;; esac
+  wan_iface="$(uci_get "$CONFIG.wan_interface")"
+  [ -n "$wan_iface" ] || wan_iface=auto
+  ipv6="$(uci_get "$CONFIG.ipv6")"
+  case "$ipv6" in 0|1) ;; *) ipv6=1 ;; esac
+  other_ports="$(uci_get "$CONFIG.log_other_ports")"
+  case "$other_ports" in 1) ;; *) other_ports=0 ;; esac
 }
 
 load_ports() {
-	ports="$(uci_get "$CONFIG.ports")"
-	[ -n "$ports" ] || ports="21 22 23 25 53 69 80 81 110 111 123 135 137 138 139 143 161 162 179 389 427 443 445 465 500 502 514 515 520 548 554 587 631 636 873 902 989 990 993 995 1080 1194 1433 1434 1521 1701 1723 1883 1900 2049 2082 2083 2181 2222 2375 2376 2483 2484 3000 3128 3268 3306 3389 3690 4444 4500 5000 5001 5060 5061 5432 5555 5601 5672 5900 5985 5986 6379 6443 6667 7001 7070 7443 7547 7777 8000 8008 8080 8081 8088 8291 8443 8883 8888 9000 9042 9090 9200 9300 9418 10000 10250 11211 27017 51820"
-	ports="$(printf '%s' "$ports" | tr ',\n\t' '   ')"
-	NORMALIZED_PORTS=""
-	for port in $ports; do
-		case "$port" in ''|*[!0-9]*|??????*) continue ;; esac
-		[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || continue
-		case " $NORMALIZED_PORTS " in *" $port "*) continue ;; esac
-		NORMALIZED_PORTS="${NORMALIZED_PORTS:+$NORMALIZED_PORTS }$port"
-	done
+  ports="$(uci_get "$CONFIG.ports")"
+  [ -n "$ports" ] || ports="21 22 23 25 53 69 80 81 110 111 123 135 137 138 139 143 161 162 179 389 427 443 445 465 500 502 514 515 520 548 554 587 631 636 873 902 989 990 993 995 1080 1194 1433 1434 1521 1701 1723 1883 1900 2049 2082 2083 2181 2222 2375 2376 2483 2484 3000 3128 3268 3306 3389 3690 4444 4500 5000 5001 5060 5061 5432 5555 5601 5672 5900 5985 5986 6379 6443 6667 7001 7070 7443 7547 7777 8000 8008 8080 8081 8088 8291 8443 8883 8888 9000 9042 9090 9200 9300 9418 10000 10250 11211 27017 51820"
+  ports="$(printf '%s' "$ports" | tr ',\n\t' '   ')"
+  NORMALIZED_PORTS=""
+  for port in $ports; do
+    case "$port" in ''|*[!0-9]*|??????*) continue ;; esac
+    [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || continue
+    case " $NORMALIZED_PORTS " in *" $port "*) continue ;; esac
+    NORMALIZED_PORTS="${NORMALIZED_PORTS:+$NORMALIZED_PORTS }$port"
+  done
 }
 
-install_groups() {
-	protocol="$1"
-	list="$2"
-	chain="$3"
-	group=""
-	count=0
-	for port in $list; do
-		if [ "$count" -ge 15 ]; then
-			add_group_rule "$protocol" "$group" "$chain"
-			group=""
-			count=0
-		fi
-		group="${group:+$group,}$port"
-		count=$((count + 1))
-	done
-	[ -z "$group" ] || add_group_rule "$protocol" "$group" "$chain"
+resolve_wan() {
+  if [ "$wan_iface" != auto ]; then
+    printf '%s\n' "$wan_iface"
+    return 0
+  fi
+  command -v ubus >/dev/null 2>&1 || return 1
+  command -v jsonfilter >/dev/null 2>&1 || return 1
+  status="$(ubus call network.interface.wan status 2>/dev/null)"
+  device="$(printf '%s' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null | head -n 1)"
+  [ -n "$device" ] || device="$(printf '%s' "$status" | jsonfilter -e '@.device' 2>/dev/null | head -n 1)"
+  case "$device" in
+    ''|*[!a-zA-Z0-9_.:-]*) return 1 ;;
+  esac
+  printf '%s\n' "$device"
 }
 
-add_group_rule() {
-	protocol="$1"
-	ports="$2"
-	chain="$3"
-	# goto: a listed port returns to PREROUTING from the log chain, so it does not
-	# also match the low-rate rule later in MATCH_CHAIN.
-	if [ "$protocol" = tcp ]; then
-		iptables -t raw -A "$MATCH_CHAIN" -i "$WAN_IF" -p tcp -m multiport --dports "$ports" -m tcp --syn -g "$chain"
-	else
-		iptables -t raw -A "$MATCH_CHAIN" -i "$WAN_IF" -p udp -m multiport --dports "$ports" -g "$chain"
-	fi
+zone_exists() {
+  want="$1"
+  found=0
+  # Without a readable firewall configuration there is nothing to verify; the
+  # configured name is used as-is and fw4 ignores chains that do not exist.
+  [ -r "$FIREWALL_CONFIG" ] || return 0
+  config_load firewall 2>/dev/null || true
+  check_zone() {
+    config_get zone_name "$1" name
+    [ "$zone_name" = "$want" ] && found=1
+    return 0
+  }
+  config_foreach check_zone zone || true
+  [ "$found" = 1 ]
 }
 
-install_log_chain() {
-	chain="$1"
-	table="$2"
-	rate="$3"
-	burst="$4"
-	prefix="$5"
-	iptables -t raw -N "$chain" 2>/dev/null || true
-	iptables -t raw -F "$chain" || return 1
-	if iptables -t raw -A "$chain" -m hashlimit \
-		--hashlimit-name "$table" \
-		--hashlimit-mode srcip \
-		--hashlimit-upto "$rate" \
-		--hashlimit-burst "$burst" \
-		--hashlimit-htable-expire 120000 \
-		-j LOG --log-prefix "$prefix" --log-level 4
-	then
-		:
-	else
-		LOG_MODE=shared
-		iptables -t raw -A "$chain" -m limit --limit "$rate" --limit-burst "$burst" \
-			-j LOG --log-prefix "$prefix" --log-level 4 || return 1
-	fi
-	iptables -t raw -A "$chain" -j RETURN || return 1
+load_forward_ports() {
+  FORWARD_PORTS=""
+  config_load firewall 2>/dev/null || return 0
+  config_foreach collect_forward_port redirect || true
 }
 
-apply_rules() {
-	command -v iptables >/dev/null 2>&1 || {
-		[ "$(uci_get "$CONFIG.enabled")" != 0 ] || return 0
-		echo 'iptables is unavailable; WAN port logging was not enabled.' >&2
-		return 1
+collect_forward_port() {
+  section="$1"
+  config_get forward_enabled "$section" enabled 1
+  [ "$forward_enabled" = 0 ] && return 0
+  config_get target "$section" target DNAT
+  [ "$target" = DNAT ] || return 0
+  config_get source_ports "$section" src_dport
+  [ -n "$source_ports" ] || return 0
+  add_forward_spec "$source_ports"
+}
+
+remember_forward_port() {
+  port="$1"
+  case "$port" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || return 0
+  case " $FORWARD_PORTS " in *" $port "*) return 0 ;; esac
+  FORWARD_PORTS="${FORWARD_PORTS:+$FORWARD_PORTS }$port"
+}
+
+add_forward_spec() {
+  spec="$(printf '%s' "$1" | tr ',' ' ')"
+  for token in $spec; do
+    case "$token" in
+      *-*)
+        start="${token%-*}"
+        end="${token#*-}"
+        case "$start$end" in *[!0-9]*) continue ;; esac
+        [ "$end" -ge "$start" ] 2>/dev/null || continue
+        span=$((end - start + 1))
+        # A huge redirect range is not a single exposed service.
+        [ "$span" -le 64 ] || continue
+        port="$start"
+        while [ "$port" -le "$end" ]; do
+          remember_forward_port "$port"
+          port=$((port + 1))
+        done
+        ;;
+      *) remember_forward_port "$token" ;;
+    esac
+  done
+}
+
+split_port_budgets() {
+  SCAN_PORTS=""
+  FWD_PORTS=""
+  for port in $NORMALIZED_PORTS; do
+    case " $FORWARD_PORTS " in
+      *" $port "*) FWD_PORTS="${FWD_PORTS:+$FWD_PORTS }$port" ;;
+      *) SCAN_PORTS="${SCAN_PORTS:+$SCAN_PORTS }$port" ;;
+    esac
+  done
+}
+
+# --------------------------------------------------------------- helpers ----
+
+port_elements() {
+  # "21, 22, 23" for an nft set body.
+  out=""
+  for port in $1; do
+    out="${out:+$out, }$port"
+  done
+  printf '%s' "$out"
+}
+
+meter() {
+  # name family rate burst
+  case "$2" in
+    v4) addr="ip saddr" ;;
+    v6) addr="ip6 saddr" ;;
+    *) return 1 ;;
+  esac
+  printf 'meter %s { %s timeout 2m limit rate %s burst %s packets }' "$1" "$addr" "$3" "$4"
+}
+
+fail() {
+  echo "$1" >&2
+  return 1
+}
+
+remove_verdict_includes() {
+  # Remove every generated file, not just the ones for the currently configured
+  # zone: a zone rename must not leave an orphaned include behind.
+  rm -f "$INCLUDE_DIR/table-pre/10-log-viewer.nft" 2>/dev/null || true
+  for path in "$INCLUDE_DIR"/chain-post/input_*/10-log-viewer.nft \
+              "$INCLUDE_DIR"/chain-post/forward_*/10-log-viewer.nft; do
+    [ -e "$path" ] && rm -f "$path" 2>/dev/null
+  done
+  # Drop the chain directories only if they became empty; another package may
+  # own files in the same chain.
+  for dir in "$INCLUDE_DIR"/chain-post/input_* "$INCLUDE_DIR"/chain-post/forward_*; do
+    [ -d "$dir" ] && rmdir "$dir" 2>/dev/null
+  done
+  return 0
+}
+
+remove_legacy_iptables() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  for chain in REFFIX_INFRA_WATCH INFRA_PORT_LOG INFRA_PORT_FWD INFRA_PORT_OTHER; do
+    while iptables -t raw -D PREROUTING -j "$chain" 2>/dev/null; do :; done
+    iptables -t raw -F "$chain" 2>/dev/null || true
+    iptables -t raw -X "$chain" 2>/dev/null || true
+  done
+}
+
+remove_all() {
+  if nft_present; then
+    nft delete table inet "$TABLE" 2>/dev/null || true
+  fi
+  remove_verdict_includes
+  remove_legacy_iptables
+}
+
+fw4_reload() {
+  if [ -n "$FW4_INIT" ] && [ -x "$FW4_INIT" ]; then
+    "$FW4_INIT" reload >/dev/null 2>&1 && return 0
+  fi
+  if command -v fw4 >/dev/null 2>&1; then
+    fw4 reload >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+fw4_validate() {
+  # Render the current firewall configuration including our new includes and
+  # let nft parse it. A broken include therefore never reaches the live ruleset.
+  command -v fw4 >/dev/null 2>&1 || return 0
+  rendered="${TMPDIR:-/tmp}/log-viewer-fw4.$$"
+  if fw4 print > "$rendered" 2>/dev/null; then
+    if nft -c -f "$rendered" >/dev/null 2>&1; then
+      rm -f "$rendered"
+      return 0
+    fi
+    rm -f "$rendered"
+    return 1
+  fi
+  rm -f "$rendered"
+  return 0
+}
+
+install_probe() {
+  wan="$(resolve_wan 2>/dev/null || true)"
+  [ -n "$wan" ] || { fail "Unable to resolve the WAN interface. Set one explicitly in WAN watch settings."; return 1; }
+  [ -n "$NORMALIZED_PORTS" ] || { fail "The WAN watch port list is empty."; return 1; }
+
+  load_forward_ports
+  split_port_budgets
+  file="${TMPDIR:-/tmp}/log-viewer-probe.$$"
+
+  {
+    printf 'table inet %s {\n' "$TABLE"
+    printf '\tchain prerouting {\n\t\ttype filter hook prerouting priority raw; policy accept;\n'
+    if [ -n "$SCAN_PORTS" ]; then
+      printf '\t\tiifname "%s" tcp flags & (fin|syn|rst|ack) == syn tcp dport { %s } %s counter log prefix "INFRA_PORT_HIT: " level info\n' \
+        "$wan" "$(port_elements "$SCAN_PORTS")" "$(meter lv_scan4 v4 "$RATE_KNOWN" "$BURST_KNOWN")"
+      printf '\t\tiifname "%s" udp dport { %s } %s counter log prefix "INFRA_PORT_HIT: " level info\n' \
+        "$wan" "$(port_elements "$SCAN_PORTS")" "$(meter lv_scan4u v4 "$RATE_KNOWN" "$BURST_KNOWN")"
+      if [ "$ipv6" = 1 ]; then
+        printf '\t\tiifname "%s" tcp flags & (fin|syn|rst|ack) == syn tcp dport { %s } %s counter log prefix "INFRA_PORT_HIT: " level info\n' \
+          "$wan" "$(port_elements "$SCAN_PORTS")" "$(meter lv_scan6 v6 "$RATE_KNOWN" "$BURST_KNOWN")"
+        printf '\t\tiifname "%s" udp dport { %s } %s counter log prefix "INFRA_PORT_HIT: " level info\n' \
+          "$wan" "$(port_elements "$SCAN_PORTS")" "$(meter lv_scan6u v6 "$RATE_KNOWN" "$BURST_KNOWN")"
+      fi
+    fi
+    if [ -n "$FWD_PORTS" ]; then
+      printf '\t\tiifname "%s" tcp flags & (fin|syn|rst|ack) == syn tcp dport { %s } %s counter log prefix "INFRA_PORT_HIT: " level info\n' \
+        "$wan" "$(port_elements "$FWD_PORTS")" "$(meter lv_fwd4 v4 "$RATE_FWD" "$BURST_FWD")"
+      printf '\t\tiifname "%s" udp dport { %s } %s counter log prefix "INFRA_PORT_HIT: " level info\n' \
+        "$wan" "$(port_elements "$FWD_PORTS")" "$(meter lv_fwd4u v4 "$RATE_FWD" "$BURST_FWD")"
+      if [ "$ipv6" = 1 ]; then
+        printf '\t\tiifname "%s" tcp flags & (fin|syn|rst|ack) == syn tcp dport { %s } %s counter log prefix "INFRA_PORT_HIT: " level info\n' \
+          "$wan" "$(port_elements "$FWD_PORTS")" "$(meter lv_fwd6 v6 "$RATE_FWD" "$BURST_FWD")"
+        printf '\t\tiifname "%s" udp dport { %s } %s counter log prefix "INFRA_PORT_HIT: " level info\n' \
+          "$wan" "$(port_elements "$FWD_PORTS")" "$(meter lv_fwd6u v6 "$RATE_FWD" "$BURST_FWD")"
+      fi
+    fi
+    if [ "$other_ports" = 1 ]; then
+      printf '\t\tiifname "%s" tcp flags & (fin|syn|rst|ack) == syn tcp dport != { %s } %s counter log prefix "INFRA_PORT_OTHER: " level info\n' \
+        "$wan" "$(port_elements "$NORMALIZED_PORTS")" "$(meter lv_oth4 v4 "$RATE_OTHER" "$BURST_OTHER")"
+      printf '\t\tiifname "%s" udp dport != { %s } %s counter log prefix "INFRA_PORT_OTHER: " level info\n' \
+        "$wan" "$(port_elements "$NORMALIZED_PORTS")" "$(meter lv_oth4u v4 "$RATE_OTHER" "$BURST_OTHER")"
+      if [ "$ipv6" = 1 ]; then
+        printf '\t\tiifname "%s" tcp flags & (fin|syn|rst|ack) == syn tcp dport != { %s } %s counter log prefix "INFRA_PORT_OTHER: " level info\n' \
+          "$wan" "$(port_elements "$NORMALIZED_PORTS")" "$(meter lv_oth6 v6 "$RATE_OTHER" "$BURST_OTHER")"
+        printf '\t\tiifname "%s" udp dport != { %s } %s counter log prefix "INFRA_PORT_OTHER: " level info\n' \
+          "$wan" "$(port_elements "$NORMALIZED_PORTS")" "$(meter lv_oth6u v6 "$RATE_OTHER" "$BURST_OTHER")"
+      fi
+    fi
+    printf '\t}\n}\n'
+  } > "$file"
+
+  if ! nft -c -f "$file" >/dev/null 2>&1; then
+    rm -f "$file"
+    fail "The generated nftables ruleset was rejected by nft; nothing was changed."
+    return 1
+  fi
+  nft delete table inet "$TABLE" 2>/dev/null || true
+  if ! nft -f "$file"; then
+    rm -f "$file"
+    fail "nft could not load the watch ruleset."
+    return 1
+  fi
+  rm -f "$file"
+  echo "INFRA_PORT_WATCH probe installed on $wan (IPv4$([ "$ipv6" = 1 ] && echo '+IPv6'))"
+}
+
+install_verdict() {
+  [ -n "$NORMALIZED_PORTS" ] || { fail "The WAN watch port list is empty."; return 1; }
+  if ! zone_exists "$wan_zone"; then
+    fail "Firewall zone '$wan_zone' not found. Set the WAN zone name in WAN watch settings."
+    return 1
+  fi
+
+  mkdir -p "$INCLUDE_DIR/table-pre" "$INCLUDE_DIR/chain-post/input_$wan_zone" "$INCLUDE_DIR/chain-post/forward_$wan_zone"
+
+  cat > "$INCLUDE_DIR/table-pre/10-log-viewer.nft" <<EOF
+	set lv_watch_ports {
+		type inet_service
+		elements = { $(port_elements "$NORMALIZED_PORTS") }
 	}
-	resolved_wan="$(resolve_wan 2>/dev/null || true)"
-	WAN_IF="${resolved_wan:-eth2}"
-	load_ports
-	remove_legacy_rules
-	[ "$(uci_get "$CONFIG.enabled")" != 0 ] || { remove_rules; return 0; }
-	[ -n "$resolved_wan" ] || { echo 'Unable to resolve the configured WAN interface.' >&2; return 1; }
-	WAN_IF="$resolved_wan"
-	[ -n "$NORMALIZED_PORTS" ] || { echo 'The WAN watch port list is empty.' >&2; return 1; }
-	load_forward_ports
-	split_port_budgets
-	remove_rules
-	LOG_MODE=per-source
-	other_ports="$(uci_get "$CONFIG.log_other_ports")"
-	case "$other_ports" in 1) ;; *) other_ports=0 ;; esac
-	iptables -t raw -N "$MATCH_CHAIN" 2>/dev/null || true
-	iptables -t raw -F "$MATCH_CHAIN" || return 1
-	install_log_chain "$LOG_CHAIN" reffix_scan 30/minute 15 'INFRA_PORT_HIT: ' || return 1
-	install_log_chain "$FWD_CHAIN" reffix_fwd 4/minute 4 'INFRA_PORT_HIT: ' || return 1
-	if [ "$other_ports" = 1 ]; then
-		install_log_chain "$OTHER_CHAIN" reffix_other 2/minute 5 'INFRA_PORT_OTHER: ' || return 1
-	fi
-	mkdir -p /tmp/log-viewer
-	printf '%s\n' "$LOG_MODE" > "$RATE_NOTE"
-	[ -z "$SCAN_PORTS" ] || { install_groups tcp "$SCAN_PORTS" "$LOG_CHAIN"; install_groups udp "$SCAN_PORTS" "$LOG_CHAIN"; }
-	[ -z "$FWD_PORTS" ] || { install_groups tcp "$FWD_PORTS" "$FWD_CHAIN"; install_groups udp "$FWD_PORTS" "$FWD_CHAIN"; }
-	if [ "$other_ports" = 1 ]; then
-		iptables -t raw -A "$MATCH_CHAIN" -i "$WAN_IF" -p tcp -m tcp --syn -j "$OTHER_CHAIN" || return 1
-		iptables -t raw -A "$MATCH_CHAIN" -i "$WAN_IF" -p udp -j "$OTHER_CHAIN" || return 1
-	fi
-	iptables -t raw -A "$MATCH_CHAIN" -j RETURN || return 1
-	iptables -t raw -I PREROUTING 1 -j "$MATCH_CHAIN" || return 1
-	echo "INFRA_PORT_WATCH installed on $WAN_IF"
+EOF
+
+  write_chain_include() {
+    chain="$1"
+    prefix="$2"
+    meter_base="$3"
+    {
+      printf '\t\ttcp flags & (fin|syn|rst|ack) == syn tcp dport @lv_watch_ports %s counter log prefix "%s" level info\n' \
+        "$(meter "${meter_base}4" v4 "$RATE_KNOWN" "$BURST_KNOWN")" "$prefix"
+      printf '\t\tudp dport @lv_watch_ports %s counter log prefix "%s" level info\n' \
+        "$(meter "${meter_base}4u" v4 "$RATE_KNOWN" "$BURST_KNOWN")" "$prefix"
+      if [ "$ipv6" = 1 ]; then
+        printf '\t\ttcp flags & (fin|syn|rst|ack) == syn tcp dport @lv_watch_ports %s counter log prefix "%s" level info\n' \
+          "$(meter "${meter_base}6" v6 "$RATE_KNOWN" "$BURST_KNOWN")" "$prefix"
+        printf '\t\tudp dport @lv_watch_ports %s counter log prefix "%s" level info\n' \
+          "$(meter "${meter_base}6u" v6 "$RATE_KNOWN" "$BURST_KNOWN")" "$prefix"
+      fi
+      if [ "$other_ports" = 1 ]; then
+        printf '\t\ttcp flags & (fin|syn|rst|ack) == syn tcp dport != @lv_watch_ports %s counter log prefix "INFRA_PORT_OTHER: " level info\n' \
+          "$(meter "${meter_base}o4" v4 "$RATE_OTHER" "$BURST_OTHER")"
+        printf '\t\tudp dport != @lv_watch_ports %s counter log prefix "INFRA_PORT_OTHER: " level info\n' \
+          "$(meter "${meter_base}o4u" v4 "$RATE_OTHER" "$BURST_OTHER")"
+        if [ "$ipv6" = 1 ]; then
+          printf '\t\ttcp flags & (fin|syn|rst|ack) == syn tcp dport != @lv_watch_ports %s counter log prefix "INFRA_PORT_OTHER: " level info\n' \
+            "$(meter "${meter_base}o6" v6 "$RATE_OTHER" "$BURST_OTHER")"
+          printf '\t\tudp dport != @lv_watch_ports %s counter log prefix "INFRA_PORT_OTHER: " level info\n' \
+            "$(meter "${meter_base}o6u" v6 "$RATE_OTHER" "$BURST_OTHER")"
+        fi
+      fi
+    } > "$INCLUDE_DIR/chain-post/$chain/10-log-viewer.nft"
+  }
+
+  write_chain_include "input_$wan_zone" "INFRA_PORT_BLOCK: " "lv_vin"
+  write_chain_include "forward_$wan_zone" "INFRA_PORT_BLOCK: " "lv_vfw"
+
+  if ! fw4_validate; then
+    remove_verdict_includes
+    fail "The firewall rejected the generated include; the previous ruleset is unchanged."
+    return 1
+  fi
+
+  if ! fw4_reload; then
+    remove_verdict_includes
+    fail "Could not reload the firewall to activate the watch rules."
+    return 1
+  fi
+  echo "INFRA_PORT_WATCH verdict mode installed on zone $wan_zone (IPv4$([ "$ipv6" = 1 ] && echo '+IPv6'))"
+}
+
+# ---------------------------------------------------------------- status ----
+
+installed_probe() {
+  nft_present || return 1
+  nft list table inet "$TABLE" >/dev/null 2>&1
+}
+
+installed_verdict() {
+  nft_present || return 1
+  nft list chain inet fw4 "input_$wan_zone" 2>/dev/null | grep -q 'INFRA_PORT_BLOCK'
+}
+
+rate_text() {
+  if [ "$mode" = verdict ]; then
+    text="${RATE_KNOWN} per source on confirmed drops"
+    [ "$other_ports" = 1 ] && text="$text; ${RATE_OTHER} per source on other ports"
+  else
+    text="${RATE_KNOWN} per source on listed ports; ${RATE_FWD} per source on forwarded ports"
+    [ "$other_ports" = 1 ] && text="$text; ${RATE_OTHER} per source on other ports"
+  fi
+  printf '%s' "$text"
 }
 
 print_config() {
-	enabled="$(uci_get "$CONFIG.enabled")"; [ -n "$enabled" ] || enabled=1
-	wan="$(uci_get "$CONFIG.wan_interface")"; [ -n "$wan" ] || wan=auto
-	other_ports="$(uci_get "$CONFIG.log_other_ports")"
-	case "$other_ports" in 1) ;; *) other_ports=0 ;; esac
-	load_ports
-	active=""
-	if [ "$enabled" = 1 ]; then active="$(resolve_wan 2>/dev/null || true)"; fi
-	ports_json="$(printf '%s' "$NORMALIZED_PORTS" | awk '{ for (i=1;i<=NF;i++) printf "%s%s", (i==1?"":","), $i }')"
-	installed=0
-	if [ "$enabled" = 1 ] && [ -n "$active" ] && command -v iptables >/dev/null 2>&1 &&
-		iptables -t raw -C PREROUTING -j "$MATCH_CHAIN" 2>/dev/null; then installed=1; fi
-	json_init
-	json_add_boolean enabled "$([ "$enabled" = 1 ] && echo 1 || echo 0)"
-	json_add_string wan_interface "$wan"
-	json_add_string active_interface "$active"
-	json_add_string ports "$ports_json"
-	json_add_string router_time "$(date +%s 2>/dev/null || echo 0)"
-	json_add_string router_offset "$(date +%z 2>/dev/null || echo '')"
-	json_add_boolean installed "$installed"
-	json_add_string address_family 'IPv4 only'
-	json_add_boolean log_other_ports "$other_ports"
-	rate_mode="$(cat "$RATE_NOTE" 2>/dev/null || echo per-source)"
-	if [ "$rate_mode" = shared ]; then
-		if [ "$other_ports" = 1 ]; then
-			json_add_string log_rate 'shared fallback, hashlimit unavailable: 30 per minute, forwarded ports 4 per minute, other ports 2 per minute'
-		else
-			json_add_string log_rate 'shared fallback, hashlimit unavailable: 30 per minute, forwarded ports 4 per minute; other-port sampling off'
-		fi
-	else
-		if [ "$other_ports" = 1 ]; then
-			json_add_string log_rate '30 per minute per source after burst of 15; forwarded ports 4 per minute per source; other ports 2 per minute per source after burst of 5'
-		else
-			json_add_string log_rate '30 per minute per source after burst of 15; forwarded ports 4 per minute per source; other-port sampling off'
-		fi
-	fi
-	json_add_array redirects
-	# A missing firewall config must not hide WAN watch status.
-	CONFIG_SECTIONS="${CONFIG_SECTIONS:-}"
-	config_load firewall || true
-	config_foreach add_redirect redirect
-	json_close_array
-	json_dump
+  load_settings
+  load_ports
+  active=""
+  installed=0
+  zone_found=false
+  if [ "$enabled" = 1 ]; then
+    if [ "$mode" = verdict ]; then
+      zone_exists "$wan_zone" && zone_found=true
+      # Still report the device the zone uses when ubus can tell us.
+      wan_iface_saved="$wan_iface"
+      wan_iface=auto
+      active="$(resolve_wan 2>/dev/null || true)"
+      wan_iface="$wan_iface_saved"
+      installed_verdict && installed=1
+    else
+      active="$(resolve_wan 2>/dev/null || true)"
+      installed_probe && installed=1
+    fi
+  fi
+
+  ports_json="$(printf '%s' "$NORMALIZED_PORTS" | awk '{ for (i = 1; i <= NF; i++) printf "%s%s", (i == 1 ? "" : ","), $i }')"
+  if [ "$mode" = verdict ]; then verdict_state=confirmed; else verdict_state=unknown; fi
+
+  printf '{"enabled":%s,"mode":"%s","verdict":"%s","wan_zone":"%s","zone_found":%s,"wan_interface":"%s","active_interface":"%s","ipv6":%s,"installed":%s,"engine":"nftables","ports":"%s","port_count":%s,"log_other_ports":%s,"log_rate":"%s","router_time":%s,"router_offset":"%s","address_family":"%s"' \
+    "$([ "$enabled" = 1 ] && echo true || echo false)" \
+    "$mode" "$verdict_state" "$(json_escape "$wan_zone")" "$zone_found" \
+    "$(json_escape "$wan_iface")" "$(json_escape "$active")" \
+    "$([ "$ipv6" = 1 ] && echo true || echo false)" \
+    "$([ "$installed" = 1 ] && echo true || echo false)" \
+    "$(json_escape "$ports_json")" "$(printf '%s' "$NORMALIZED_PORTS" | wc -w | tr -d ' ')" \
+    "$([ "$other_ports" = 1 ] && echo true || echo false)" \
+    "$(json_escape "$(rate_text)")" \
+    "$(date +%s 2>/dev/null || echo 0)" "$(date +%z 2>/dev/null || echo '')" \
+    "$([ "$ipv6" = 1 ] && echo 'IPv4+IPv6' || echo 'IPv4')"
+  printf ',"redirects":['
+  first=1
+  emit_redirect() {
+    section="$1"
+    config_get redirect_enabled "$section" enabled 1
+    [ "$redirect_enabled" = 0 ] && return 0
+    config_get target "$section" target DNAT
+    [ "$target" = DNAT ] || return 0
+    config_get source_zone "$section" src
+    config_get source_ports "$section" src_dport
+    [ -n "$source_zone" ] && [ -n "$source_ports" ] || return 0
+    config_get name "$section" name
+    config_get protocol "$section" proto tcp
+    config_get destination_port "$section" dest_port
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '{"name":"%s","source_zone":"%s","source_ports":"%s","destination_port":"%s","protocol":"%s"}' \
+      "$(json_escape "$name")" "$(json_escape "$source_zone")" \
+      "$(json_escape "$source_ports")" "$(json_escape "$destination_port")" \
+      "$(json_escape "$protocol")"
+  }
+  # A missing firewall config must not hide WAN watch status.
+  config_load firewall 2>/dev/null || true
+  config_foreach emit_redirect redirect || true
+  printf ']}\n'
 }
 
-add_redirect() {
-	section="$1"
-	config_get redirect_enabled "$section" enabled 1
-	[ "$redirect_enabled" = 0 ] && return 0
-	config_get target "$section" target DNAT
-	[ "$target" = DNAT ] || return 0
-	config_get source_zone "$section" src
-	config_get source_ports "$section" src_dport
-	[ -n "$source_zone" ] && [ -n "$source_ports" ] || return 0
-	config_get name "$section" name
-	config_get protocol "$section" proto tcp
-	config_get destination_port "$section" dest_port
-	json_add_object
-	json_add_string name "$name"
-	json_add_string source_zone "$source_zone"
-	json_add_string source_ports "$source_ports"
-	json_add_string destination_port "$destination_port"
-	json_add_string protocol "$protocol"
-	json_close_object
-}
+# ------------------------------------------------------------------ entry ----
 
 case "${1:-}" in
-	get) print_config ;;
-	apply) apply_rules ;;
-	remove) remove_rules ;;
-	*) echo 'usage: infra-port-watch {get|apply|remove}' >&2; exit 2 ;;
+  get) print_config ;;
+  apply)
+    load_settings
+    load_ports
+    remove_all
+    [ "$enabled" = 1 ] || { echo "INFRA_PORT_WATCH disabled"; exit 0; }
+    nft_present || { fail "nft is not available; the WAN watch needs nftables."; exit 1; }
+    if [ "$mode" = verdict ]; then
+      install_verdict
+    else
+      install_probe
+    fi
+    ;;
+  remove)
+    load_settings
+    remove_all
+    fw4_reload || true
+    echo "INFRA_PORT_WATCH removed"
+    ;;
+  *) echo 'usage: infra-port-watch {get|apply|remove}' >&2; exit 2 ;;
 esac

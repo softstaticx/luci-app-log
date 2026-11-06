@@ -1,0 +1,5 @@
+#!/bin/sh
+# /etc/init.d/firewall stand-in: records that a reload was requested.
+set -eu
+printf '%s %s\n' "${1:-}" "reload" >> "${FAKE_FW4_INIT_LOG:?FAKE_FW4_INIT_LOG must be set}"
+exit 0

@@ -1,0 +1,55 @@
+#!/bin/sh
+# Minimal uci(1) stand-in for the shell test suite. Values live in the file
+# named by $FAKE_UCI as "package.section.option=value" lines.
+set -eu
+
+db="${FAKE_UCI:?FAKE_UCI must point at a key=value file}"
+
+[ "${1:-}" = "-q" ] && shift
+
+get_key() {
+  key="$1"
+  [ -f "$db" ] || return 1
+  value="$(sed -n "s|^${key}=||p" "$db" | tail -n 1)"
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
+}
+
+case "${1:-}" in
+  get)
+    get_key "$2"
+    ;;
+  set)
+    entry="$2"
+    case "$entry" in
+      *=*) ;;
+      *) exit 1 ;;
+    esac
+    key="${entry%%=*}"
+    value="${entry#*=}"
+    mkdir -p "$(dirname "$db")"
+    if [ -f "$db" ]; then
+      sed -i "\|^${key}=|d" "$db" 2>/dev/null || true
+    fi
+    printf '%s=%s\n' "$key" "$value" >> "$db"
+    ;;
+  add_list)
+    key="${2%%=*}"
+    value="${2#*=}"
+    printf '%s=%s\n' "$key" "$value" >> "$db"
+    ;;
+  delete)
+    key="$2"
+    [ -f "$db" ] || exit 0
+    sed -i "\|^${key}|d" "$db" 2>/dev/null || true
+    ;;
+  commit)
+    exit 0
+    ;;
+  show)
+    [ -f "$db" ] && cat "$db"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

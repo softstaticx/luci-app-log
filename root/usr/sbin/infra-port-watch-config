@@ -1,43 +1,70 @@
 #!/bin/sh
-# Validated LuCI configuration writer for the WAN port-watch service.
+# Validated configuration writer for the WAN port-watch service. Called by the
+# LuCI page and by nothing else, so the argument order is the page's contract.
+#
+#   infra-port-watch-config set <0|1> <verdict|probe> <zone> <auto|iface> \
+#                              <0|1 ipv6> <0|1 other-ports> <ports>
 set -eu
 
-[ "${1:-}" = set ] && { [ "$#" -eq 4 ] || [ "$#" -eq 5 ]; } || {
-	echo 'usage: infra-port-watch-config set <0|1> <auto|interface> <ports> [sample-other-ports 0|1]' >&2
-	exit 2
+WATCH_BIN="${LOG_VIEWER_WATCH_BIN:-/usr/sbin/infra-port-watch}"
+WATCH_INIT="${LOG_VIEWER_WATCH_INIT:-/etc/init.d/infra-port-watch}"
+CONFIG=infra-port-watch.main
+
+usage() {
+  echo 'usage: infra-port-watch-config set <0|1> <verdict|probe> <zone> <auto|interface> <0|1> <0|1> <ports>' >&2
+  exit 2
 }
+
+[ "${1:-}" = set ] || usage
+[ "$#" -eq 8 ] || usage
+
 enabled="$2"
-wan="$3"
-ports_input="$(printf '%s' "$4" | tr ',\n\t' '   ')"
-other_ports="${5:-0}"
-case "$enabled" in 0|1) ;; *) echo 'enabled must be 0 or 1' >&2; exit 2 ;; esac
-case "$other_ports" in 0|1) ;; *) echo 'sample-other-ports must be 0 or 1' >&2; exit 2 ;; esac
+mode="$3"
+zone="$4"
+wan="$5"
+ipv6="$6"
+other_ports="$7"
+ports_input="$(printf '%s' "$8" | tr ',\n\t' '   ')"
+
+case "$enabled" in 0|1) ;; *) usage ;; esac
+case "$mode" in verdict|probe) ;; *) echo 'mode must be verdict or probe' >&2; exit 2 ;; esac
+case "$ipv6" in 0|1) ;; *) echo 'ipv6 must be 0 or 1' >&2; exit 2 ;; esac
+case "$other_ports" in 0|1) ;; *) echo 'other-ports must be 0 or 1' >&2; exit 2 ;; esac
+case "$zone" in
+  ''|*[!a-zA-Z0-9_]*|?????????????????*) echo 'invalid firewall zone name' >&2; exit 2 ;;
+esac
 case "$wan" in
-	auto) ;;
-	''|*[!a-zA-Z0-9_.:-]*) echo 'invalid WAN interface' >&2; exit 2 ;;
+  auto) ;;
+  ''|*[!a-zA-Z0-9_.:-]*) echo 'invalid WAN interface' >&2; exit 2 ;;
+esac
+case "$wan" in
+  ?????????????????????????????????*) echo 'WAN interface name is too long' >&2; exit 2 ;;
 esac
 
 normalized=""
 count=0
 for port in $ports_input; do
-	case "$port" in ''|*[!0-9]*|??????*) echo "invalid port: $port" >&2; exit 2 ;; esac
-	[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || {
-		echo "port out of range: $port" >&2
-		exit 2
-	}
-	case " $normalized " in *" $port "*) continue ;; esac
-	normalized="${normalized:+$normalized }$port"
-	count=$((count + 1))
-	[ "$count" -le 256 ] || { echo 'maximum 256 ports' >&2; exit 2; }
+  case "$port" in ''|*[!0-9]*|??????*) echo "invalid port: $port" >&2; exit 2 ;; esac
+  [ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || {
+    echo "port out of range: $port" >&2
+    exit 2
+  }
+  case " $normalized " in *" $port "*) continue ;; esac
+  normalized="${normalized:+$normalized }$port"
+  count=$((count + 1))
+  [ "$count" -le 256 ] || { echo 'maximum 256 ports' >&2; exit 2; }
 done
 [ -n "$normalized" ] || { echo 'at least one port is required' >&2; exit 2; }
 
-uci -q get infra-port-watch.main >/dev/null 2>&1 || uci set infra-port-watch.main=watch
-uci set "infra-port-watch.main.enabled=$enabled"
-uci set "infra-port-watch.main.wan_interface=$wan"
-uci set "infra-port-watch.main.log_other_ports=$other_ports"
-uci -q delete infra-port-watch.main.ports 2>/dev/null || true
-for port in $normalized; do uci add_list "infra-port-watch.main.ports=$port"; done
+uci -q get "$CONFIG" >/dev/null 2>&1 || uci set "$CONFIG=watch"
+uci set "$CONFIG.enabled=$enabled"
+uci set "$CONFIG.mode=$mode"
+uci set "$CONFIG.wan_zone=$zone"
+uci set "$CONFIG.ipv6=$ipv6"
+uci set "$CONFIG.wan_interface=$wan"
+uci set "$CONFIG.log_other_ports=$other_ports"
+uci -q delete "$CONFIG.ports" 2>/dev/null || true
+for port in $normalized; do uci add_list "$CONFIG.ports=$port"; done
 uci commit infra-port-watch
-/etc/init.d/infra-port-watch restart
-/usr/sbin/infra-port-watch get
+"$WATCH_INIT" restart >/dev/null 2>&1 || echo 'warning: could not restart the WAN watch service' >&2
+"$WATCH_BIN" get

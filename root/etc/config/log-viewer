@@ -1,5 +1,12 @@
-config history 'main'
+config history 'history'
 	option enabled '0'
 	option directory '/srv/log-viewer'
 	option days '7'
 	option max_mb '32'
+	option ring '500'
+
+config geoip 'geoip'
+	option directory '/usr/share/GeoIP'
+	option url 'https://github.com/P3TERX/GeoLite.mmdb/raw/download'
+	option sha256_country ''
+	option sha256_asn ''

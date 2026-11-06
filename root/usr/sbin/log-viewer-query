@@ -1,30 +1,36 @@
 #!/bin/sh
-# Server-side firewall-history query for large persistent histories.
-# Prints a JSON page so the browser never has to load every stored line.
+# Server-side firewall-history query for luci-app-log-viewer.
+#
+# Prints one JSON page. Filtering, counting and paging run in one streaming
+# awk pass, so a large on-disk history never has to be copied into tmpfs.
+# Sorting by source or port is bounded to the most recent SORT_MAX matches and
+# reports "partial":true when the bound was reached.
 set -eu
+export LC_ALL=C
 
 RING="${LOG_VIEWER_RING:-/tmp/log-viewer/events.ring}"
 BUFFER="${LOG_VIEWER_BUFFER:-/tmp/log-viewer/persist.buffer}"
 CONFIG=log-viewer.history
+TMP_DIR="${LOG_VIEWER_TMP:-/tmp}"
+SORT_MAX=2000
+MAX_OFFSET=20000
+DEDUPE=3000
 
 LIMIT=100
 OFFSET=0
-SORT=time
+SORTBY="time"
 ORDER=desc
 VERDICT=all
 PROTOCOL=all
 PORT=
 SOURCE=
 SEARCH=
+DAYS=0
 
 PERSIST_ENABLED=0
 PERSIST_DIR=/srv/log-viewer
 
 uci_get() { uci -q get "$1" 2>/dev/null || true; }
-
-json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | tr -d '\r'
-}
 
 load_config() {
   PERSIST_ENABLED="${LOG_VIEWER_PERSIST:-0}"
@@ -44,15 +50,21 @@ load_config() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --limit) LIMIT="${2:-100}"; shift 2 ;;
-    --offset) OFFSET="${2:-0}"; shift 2 ;;
-    --sort) SORT="${2:-time}"; shift 2 ;;
-    --order) ORDER="${2:-desc}"; shift 2 ;;
-    --verdict) VERDICT="${2:-all}"; shift 2 ;;
-    --protocol) PROTOCOL="${2:-all}"; shift 2 ;;
-    --port) PORT="${2:-}"; shift 2 ;;
-    --source) SOURCE="${2:-}"; shift 2 ;;
-    --search) SEARCH="${2:-}"; shift 2 ;;
+    --limit|--offset|--sort|--order|--verdict|--protocol|--port|--source|--search|--days)
+      [ "$#" -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }
+      ;;
+  esac
+  case "$1" in
+    --limit) LIMIT="$2"; shift 2 ;;
+    --offset) OFFSET="$2"; shift 2 ;;
+    --sort) SORTBY="$2"; shift 2 ;;
+    --order) ORDER="$2"; shift 2 ;;
+    --verdict) VERDICT="$2"; shift 2 ;;
+    --protocol) PROTOCOL="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    --source) SOURCE="$2"; shift 2 ;;
+    --search) SEARCH="$2"; shift 2 ;;
+    --days) DAYS="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -60,98 +72,173 @@ done
 case "$LIMIT" in ''|*[!0-9]*) LIMIT=100 ;; esac
 [ "$LIMIT" -ge 1 ] && [ "$LIMIT" -le 500 ] || LIMIT=100
 case "$OFFSET" in ''|*[!0-9]*) OFFSET=0 ;; esac
-[ "$OFFSET" -le 1000000 ] || OFFSET=0
-case "$SORT" in time|source|port) ;; *) SORT=time ;; esac
+[ "$OFFSET" -ge 0 ] && [ "$OFFSET" -le "$MAX_OFFSET" ] || OFFSET=0
+case "$SORTBY" in time|source|port) ;; *) SORTBY="time" ;; esac
 case "$ORDER" in asc|desc) ;; *) ORDER=desc ;; esac
-case "$VERDICT" in all|blocked|allowed|other|exposed|observed) ;; *) VERDICT=all ;; esac
-case "$PROTOCOL" in all|tcp|udp) ;; *) PROTOCOL=all ;; esac
+case "$VERDICT" in all|blocked|allowed|other|probe) ;; *) VERDICT=all ;; esac
+case "$PROTOCOL" in all|tcp|udp|icmp) ;; *) PROTOCOL=all ;; esac
 case "$PORT" in '') ;; *[!0-9]*) PORT= ;; esac
-case "$SOURCE" in '') ;; *[!0-9.]*) SOURCE= ;; esac
+case "$SOURCE" in '') ;; *[!0-9a-fA-F:.]*) SOURCE= ;; esac
+case "$DAYS" in ''|*[!0-9]*) DAYS=0 ;; esac
+[ "$DAYS" -le 365 ] || DAYS=365
 
 load_config
-tmpdir="${LOG_VIEWER_TMP:-/tmp}/log-viewer-query.$$"
-mkdir -p "$tmpdir"
-trap 'rm -rf "$tmpdir"' EXIT INT TERM
-all="$tmpdir/all"
-filtered="$tmpdir/filtered"
-sorted="$tmpdir/sorted"
 
-{
+workdir="${TMP_DIR}/log-viewer-query.$$"
+mkdir -p "$workdir"
+trap 'rm -rf "$workdir"' EXIT INT TERM
+
+collect() {
   if [ "$PERSIST_ENABLED" = 1 ] && [ -d "$PERSIST_DIR" ]; then
-    for file in $(ls -1 "$PERSIST_DIR"/firewall-*.log 2>/dev/null || true); do
-      [ -r "$file" ] && cat "$file"
+    {
+      if [ "$DAYS" -gt 0 ]; then
+        find "$PERSIST_DIR" -maxdepth 1 -type f -name 'firewall-*.log' -mtime -"$DAYS" 2>/dev/null | sort
+      else
+        find "$PERSIST_DIR" -maxdepth 1 -type f -name 'firewall-*.log' 2>/dev/null | sort
+      fi
+    } | while IFS= read -r file; do
+      [ -r "$file" ] && cat -- "$file"
     done
   fi
-  if [ -f "$BUFFER" ]; then cat "$BUFFER"; fi
-  if [ -f "$RING" ]; then cat "$RING"; fi
-} | awk 'NF && !seen[$0]++' > "$all"
+  [ -f "$BUFFER" ] && cat -- "$BUFFER"
+  [ -f "$RING" ] && cat -- "$RING"
+  return 0
+}
 
-awk -v verdict="$VERDICT" -v protocol="$PROTOCOL" -v port="$PORT" -v source="$SOURCE" -v search="$SEARCH" '
-function value(line, key,    re, s) {
-  re = key "=[^ ]+"
+# Common helpers. Written to a file so both passes share them without
+# duplicating the program text, and all user input arrives through the
+# environment so backslashes are never reinterpreted by awk.
+cat > "$workdir/common.awk" <<'AWK'
+function value(line, key,   re, s) {
+  re = "(^|[ \t])" key "=([^ \t]+)"
   if (match(line, re)) {
-    s = substr(line, RSTART + length(key) + 1, RLENGTH - length(key) - 1)
+    s = substr(line, RSTART, RLENGTH)
+    sub(/^[ \t]/, "", s)
+    sub("^" key "=", "", s)
     return s
   }
   return ""
 }
 function kind(line) {
   if (line ~ /INFRA_PORT_OTHER:/) return "other"
-  if (line ~ /INFRA_PORT_HIT:/) return "blocked"
-  if (line ~ /(ALLOW|ACCEPT|PASS)/) return "allowed"
+  if (line ~ /INFRA_PORT_BLOCK:/) return "blocked"
+  if (line ~ /INFRA_PORT_HIT:/) return "probe"
+  if (line ~ /(ALLOWED|ALLOW:|ACCEPTED|ACCEPT:|PASSED|PASS:)/) return "allowed"
   if (line ~ /(DROP|REJECT|BLOCK)/) return "blocked"
-  return "observed"
+  return "probe"
 }
-function proto(line) {
-  p = value(line, "PROTO")
-  return tolower(p)
+function jesc(s,   out, i, c) {
+  out = ""
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\\") out = out "\\\\"
+    else if (c == "\"") out = out "\\\""
+    else if (c == "\t") out = out "\\t"
+    else if (c == "\r") out = out ""
+    else out = out c
+  }
+  return out
 }
+function wanted(line,   k, s) {
+  k = kind(line)
+  if (verdict == "blocked" && k != "blocked") return 0
+  if (verdict == "allowed" && k != "allowed") return 0
+  if (verdict == "other" && k != "other") return 0
+  if (verdict == "probe" && k != "probe") return 0
+  if (protocol != "all" && tolower(value(line, "PROTO")) != protocol) return 0
+  if (port != "" && value(line, "DPT") != port) return 0
+  if (source != "" && value(line, "SRC") != source) return 0
+  s = ENVIRON["LV_SEARCH"]
+  if (s != "" && index(tolower(line), tolower(s)) == 0) return 0
+  return 1
+}
+# Bounded de-duplication: the ring repeats the tail of the daily files, but the
+# history can be megabytes, so only the most recent window is remembered.
+function accept(line,   key) {
+  key = line
+  if (key in seen) return 0
+  seen[key] = 1
+  slot++
+  ringkey[slot % dedupe] = key
+  if (slot > dedupe) delete seen[ringkey[slot % dedupe]]
+  return 1
+}
+AWK
+
+if [ "$SORTBY" = time ]; then
+  cat > "$workdir/page.awk" <<'AWK'
+BEGIN { total = 0; slot = 0; n = 0; window = offset + limit }
 {
-  if (verdict != "all" && kind($0) != verdict) next
-  if (protocol != "all" && proto($0) != protocol) next
-  if (port != "" && value($0, "DPT") != port) next
-  if (source != "" && value($0, "SRC") != source) next
-  if (search != "" && index(tolower($0), tolower(search)) == 0) next
-  print
-}' "$all" > "$filtered"
-
-total="$(wc -l < "$filtered" | tr -d '[:space:]')"
-case "$total" in ''|*[!0-9]*) total=0 ;; esac
-
-if [ "$SORT" = time ]; then
-  if [ "$ORDER" = desc ]; then
-    if command -v tac >/dev/null 2>&1; then tac "$filtered" > "$sorted"; else sed '1!G;h;$!d' "$filtered" > "$sorted"; fi
-  else
-    cp "$filtered" "$sorted"
-  fi
-elif [ "$SORT" = source ]; then
-  awk '{
-    s = ""; if (match($0, /SRC=[^ ]+/)) s = substr($0, RSTART + 4, RLENGTH - 4)
-    print s "\t" $0
-  }' "$filtered" | sort | cut -f2- > "$sorted"
-  if [ "$ORDER" = desc ]; then
-    if command -v tac >/dev/null 2>&1; then tac "$sorted" > "$sorted.rev"; else sed '1!G;h;$!d' "$sorted" > "$sorted.rev"; fi
-    mv "$sorted.rev" "$sorted"
-  fi
+  if (!accept($0)) next
+  if (!wanted($0)) next
+  total++
+  if (order == "asc") {
+    if (total > offset && total <= offset + limit) page[++n] = $0
+  } else {
+    page[total % window] = $0
+  }
+}
+END {
+  if (order == "desc") {
+    start = total - offset
+    stop  = total - offset - limit + 1
+    if (stop < 1) stop = 1
+    for (i = start; i >= stop; i--) out[++n] = page[i % window]
+  } else {
+    for (i = 1; i <= n; i++) out[i] = page[i]
+  }
+  printf "{\"total\":%d,\"offset\":%d,\"limit\":%d,\"sort\":\"%s\",\"order\":\"%s\",\"partial\":false,\"lines\":[", total, offset, limit, sort, order
+  for (i = 1; i <= n; i++) printf "%s\"%s\"", (i > 1 ? "," : ""), jesc(out[i])
+  printf "]}\n"
+}
+AWK
+  collect | LV_SEARCH="$SEARCH" awk -f "$workdir/common.awk" -f "$workdir/page.awk" \
+    -v limit="$LIMIT" -v offset="$OFFSET" -v order="$ORDER" \
+    -v verdict="$VERDICT" -v protocol="$PROTOCOL" -v port="$PORT" \
+    -v source="$SOURCE" -v sort="$SORTBY" \
+    -v dedupe="$DEDUPE"
 else
-  awk '{
-    p = 0; if (match($0, /DPT=[0-9]+/)) p = substr($0, RSTART + 4, RLENGTH - 4) + 0
-    printf "%010d\t%s\n", p, $0
-  }' "$filtered" | sort -n | cut -f2- > "$sorted"
-  if [ "$ORDER" = desc ]; then
-    if command -v tac >/dev/null 2>&1; then tac "$sorted" > "$sorted.rev"; else sed '1!G;h;$!d' "$sorted" > "$sorted.rev"; fi
-    mv "$sorted.rev" "$sorted"
-  fi
+  # Sort by source or port: a bounded set is written with a sort key, sorted
+  # with the C locale, then paged. Anything beyond SORT_MAX is reported.
+  cat > "$workdir/key.awk" <<'AWK'
+BEGIN { total = 0; slot = 0; emitted = 0 }
+{
+  if (!accept($0)) next
+  if (!wanted($0)) next
+  total++
+  if (emitted < sortmax) {
+    if (sort == "source") key = value($0, "SRC")
+    else key = sprintf("%05d", value($0, "DPT") + 0)
+    printf "%s\t%s\n", key, $0
+    emitted++
+  }
+}
+END { printf "%d\n", total > totalfile }
+AWK
+  cat > "$workdir/emit.awk" <<'AWK'
+BEGIN { n = 0 }
+{ if (NR > offset && NR <= offset + limit) page[++n] = $0 }
+END {
+  printf "{\"total\":%d,\"offset\":%d,\"limit\":%d,\"sort\":\"%s\",\"order\":\"%s\",\"partial\":%s,\"lines\":[", total, offset, limit, sort, order, partial
+  for (i = 1; i <= n; i++) printf "%s\"%s\"", (i > 1 ? "," : ""), jesc(page[i])
+  printf "]}\n"
+}
+AWK
+  collect | LV_SEARCH="$SEARCH" awk -f "$workdir/common.awk" -f "$workdir/key.awk" \
+    -v verdict="$VERDICT" -v protocol="$PROTOCOL" -v port="$PORT" \
+    -v source="$SOURCE" -v sort="$SORTBY" \
+    -v sortmax="$SORT_MAX" -v dedupe="$DEDUPE" -v totalfile="$workdir/total" \
+    > "$workdir/sorted"
+
+  total="$(cat "$workdir/total" 2>/dev/null || echo 0)"
+  case "$total" in ''|*[!0-9]*) total=0 ;; esac
+  partial=false
+  [ "$total" -le "$SORT_MAX" ] || partial=true
+  reverse=""
+  [ "$ORDER" = desc ] && reverse="-r"
+  # shellcheck disable=SC2086
+  sort -t "$(printf '\t')" -k1,1 $reverse "$workdir/sorted" | cut -f2- \
+    | awk -f "$workdir/common.awk" -f "$workdir/emit.awk" \
+      -v limit="$LIMIT" -v offset="$OFFSET" -v total="$total" \
+      -v sort="$SORTBY" -v order="$ORDER" -v partial="$partial"
 fi
-
-page="$tmpdir/page"
-awk -v offset="$OFFSET" -v limit="$LIMIT" 'NR > offset && NR <= offset + limit' "$sorted" > "$page"
-
-printf '{"total":%s,"offset":%s,"limit":%s,"sort":"%s","order":"%s","lines":[' \
-  "$total" "$OFFSET" "$LIMIT" "$SORT" "$ORDER"
-first=1
-while IFS= read -r line; do
-  if [ "$first" -eq 1 ]; then first=0; else printf ','; fi
-  printf '"%s"' "$(json_escape "$line")"
-done < "$page"
-printf ']}\n'

@@ -1,0 +1,38 @@
+#!/bin/sh
+# nft(1) stand-in for the shell test suite.
+#
+# Records what would have been loaded so the tests can assert on the generated
+# ruleset, and lets a test force a parse failure.
+set -eu
+
+dir="${FAKE_NFT_DIR:?FAKE_NFT_DIR must point at a writable directory}"
+mkdir -p "$dir"
+
+case "${1:-}" in
+  -c)
+    file="${3:-}"
+    [ -n "$file" ] && cp "$file" "$dir/checked"
+    [ "${FAKE_NFT_REJECT:-0}" = "1" ] && exit 1
+    exit 0
+    ;;
+  -f)
+    file="${2:-}"
+    [ -n "$file" ] && cp "$file" "$dir/applied"
+    exit 0
+    ;;
+  delete)
+    printf '%s\n' "$*" >> "$dir/calls"
+    exit 0
+    ;;
+  list)
+    printf '%s\n' "$*" >> "$dir/calls"
+    case "${FAKE_NFT_INSTALLED:-0}" in
+      1) echo "		log prefix \"INFRA_PORT_BLOCK: \"" ; exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *)
+    printf '%s\n' "$*" >> "$dir/calls"
+    exit 0
+    ;;
+esac

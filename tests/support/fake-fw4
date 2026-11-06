@@ -1,0 +1,22 @@
+#!/bin/sh
+# fw4 stand-in for the shell test suite. "print" emits a synthetic ruleset that
+# includes nothing, which is enough for the include validation path.
+set -eu
+
+case "${1:-}" in
+  print)
+    if [ -n "${FAKE_FW4_PRINT:-}" ] && [ -f "$FAKE_FW4_PRINT" ]; then
+      cat "$FAKE_FW4_PRINT"
+    else
+      echo "table inet fw4 {"
+      echo "	chain input_wan {"
+      echo "	}"
+      echo "}"
+    fi
+    ;;
+  reload)
+    printf 'reload\n' >> "${FAKE_FW4_LOG:-/dev/null}"
+    ;;
+  *)
+    ;;
+esac

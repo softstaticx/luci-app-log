@@ -95,6 +95,37 @@ function insightFilterText(source, port, timeline) {
   return parts.join(' · ');
 }
 
+// Search supports `key:value` tokens next to free text. An unknown or invalid
+// token stays free text, so typing a colon is never an error.
+function parseQuery(text) {
+  const windows = {'5m': 300000, '15m': 900000, '1h': 3600000, '6h': 21600000, '24h': 86400000};
+  const kinds = ['blocked', 'probe', 'other', 'allowed', 'exposed', 'observed'];
+  const query = {words: [], port: null, country: '', asn: '', proto: '', verdict: '', source: '', afterMs: 0};
+  String(text || '').trim().toLowerCase().split(/\s+/).filter(Boolean).forEach(token => {
+    const match = token.match(/^(port|country|asn|proto|verdict|src|source|after):(.+)$/);
+    if (!match) { query.words.push(token); return; }
+    const key = match[1];
+    const value = match[2];
+    if (key === 'port') {
+      const port = Number(value);
+      if (Number.isInteger(port) && port >= 1 && port <= 65535) { query.port = port; return; }
+    }
+    else if (key === 'country' && /^[a-z]{2}$/.test(value)) { query.country = value.toUpperCase(); return; }
+    else if (key === 'asn' && value.length <= 60) { query.asn = value; return; }
+    else if (key === 'proto' && ['tcp', 'udp', 'icmp'].includes(value)) { query.proto = value; return; }
+    else if (key === 'verdict' && kinds.includes(value)) { query.verdict = value; return; }
+    else if ((key === 'src' || key === 'source') && /^[0-9a-f:.]+$/.test(value)) { query.source = value; return; }
+    else if (key === 'after' && windows[value]) { query.afterMs = windows[value]; return; }
+    query.words.push(token);
+  });
+  return query;
+}
+
+function queryIsEmpty(query) {
+  return query.port == null && !query.country && !query.asn && !query.proto &&
+    !query.verdict && !query.source && !query.afterMs && !query.words.length;
+}
+
 function appendWatchPort(portsText, port) {
   const portNumber = Number(port);
   if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535)
@@ -220,6 +251,7 @@ function formatLogreadTimestamp(epochMs, routerOffset) {
 
 function parseLine(line, index, routerOffset) {
   const otherHit = line.includes('INFRA_PORT_OTHER:');
+  const confirmedHit = line.includes('INFRA_PORT_BLOCK:');
   const infraHit = line.includes('INFRA_PORT_HIT:');
   const hasPacketTuple = /SRC=\S+.*DPT=\d+/.test(line);
   const blockMarker = /\b(?:DROP|REJECT)\b/i.test(line) ||
@@ -231,21 +263,31 @@ function parseLine(line, index, routerOffset) {
 
   let prefix = '';
   let kind = '';
+  let verdictKnown = false;
   if (otherHit) {
     prefix = 'INFRA_PORT_OTHER';
     kind = 'Other';
   }
+  else if (confirmedHit) {
+    // Emitted from a fw4 chain-post rule: the packet survived every user rule
+    // and is about to be dropped by the zone policy.
+    prefix = 'INFRA_PORT_BLOCK';
+    kind = 'Blocked';
+    verdictKnown = true;
+  }
   else if (infraHit) {
     prefix = 'INFRA_PORT_HIT';
-    kind = 'Blocked';
+    kind = 'Probe';
   }
   else if (hasPacketTuple && blockMarker) {
     prefix = 'FIREWALL_BLOCK';
     kind = 'Blocked';
+    verdictKnown = true;
   }
   else if (hasPacketTuple && allowMarker) {
     prefix = 'FIREWALL_ALLOW';
     kind = 'Allowed';
+    verdictKnown = true;
   }
   else return null;
 
@@ -273,6 +315,7 @@ function parseLine(line, index, routerOffset) {
       (fields.PROTO === 'UDP' ? 'UDP packet' : ''),
     prefix: prefix,
     marker: marker || prefix,
+    verdictKnown: verdictKnown,
     policyLabel: '',
     policyNote: ''
   };
@@ -528,32 +571,26 @@ return view.extend({
 
   applyTrafficContext: function(event) {
     const other = event.prefix === 'INFRA_PORT_OTHER';
-    if (event.prefix !== 'INFRA_PORT_HIT' && !other) return event;
+    const probe = event.prefix === 'INFRA_PORT_HIT';
+    if (!other && !probe) return event;
 
-    event.kind = event.baseKind || (other ? 'Other' : 'Blocked');
-    event.policyLabel = event.basePolicyLabel || (other ? 'Not on the watch list' : 'Default deny');
-    event.policyNote = event.basePolicyNote || '';
+    event.kind = other ? 'Other' : 'Probe';
+    event.policyLabel = other ? _('Not on the watch list') : _('Probe');
+    event.policyNote = other
+      ? _('Low-rate sample of a port outside the watch list. The verdict was not observed.')
+      : _('Probe seen before the firewall decides; probe mode does not observe the verdict.');
 
     const iface = String(event.iface || '').toLowerCase();
     const onWan = !this.wanInterfaces.length || this.wanInterfaces.includes(iface);
     if (!onWan) {
       event.kind = 'Observed';
-      event.policyNote = 'Probe on an interface not configured as WAN. Set the WAN interface to classify it.';
+      event.policyNote = _('Probe on an interface not configured as WAN. Set the WAN device in WAN watch settings.');
+      return event;
     }
-    else if (this.exposedPorts[event.dport]) {
+    if (this.exposedPorts[event.dport]) {
       event.kind = 'Exposed';
       event.policyLabel = this.exposedPorts[event.dport];
-      event.policyNote = 'Hit matches a configured exposed service. This line does not confirm whether the forward accepted it.';
-    }
-    else if (other) {
-      event.kind = 'Other';
-      if (!event.basePolicyLabel) event.policyLabel = 'Not on the watch list';
-      event.policyNote = 'Low-rate sample of a port outside the watch list. Default policy drops it unless an allow or forward applies.';
-    }
-    else {
-      event.kind = 'Blocked';
-      if (!event.basePolicyLabel) event.policyLabel = 'Default deny';
-      event.policyNote = 'No allow or forward for this port. The watch logged the probe; the firewall default policy drops it.';
+      event.policyNote = _('Port carries a local service label. Only probe mode can classify it this way.');
     }
     return event;
   },
@@ -564,8 +601,8 @@ return view.extend({
       const presets = JSON.parse(localStorage.getItem('reffix-log-viewer.filters') || '[]');
       this.filterPresets = Array.isArray(presets) ? presets.filter(p =>
         p && typeof p.name === 'string' && typeof p.query === 'string' &&
-        ['known', 'all', 'blocked', 'other', 'observed', 'allowed', 'exposed'].includes(p.kind) &&
-        ['all', 'tcp', 'udp'].includes(p.proto) &&
+        ['known', 'all', 'blocked', 'probe', 'other', 'observed', 'allowed', 'exposed'].includes(p.kind) &&
+        ['all', 'tcp', 'udp', 'icmp'].includes(p.proto) &&
         ['all', '5m', '15m', '1h', '6h', '24h'].includes(p.window)
       ).slice(0, 20) : [];
       this.historyRetention = ['off', '1', '7', '30'].includes(localStorage.getItem('reffix-log-viewer.history-days'))
@@ -578,6 +615,58 @@ return view.extend({
       this.historyRetention = 'off';
       this.geoMemory = {};
     }
+  },
+
+  // Filters live in the query string so a view can be bookmarked or pasted into
+  // a forum post. Unknown values are ignored rather than trusted.
+  loadUrlState: function() {
+    let params;
+    try { params = new URLSearchParams(location.search); }
+    catch (e) { return; }
+    const pick = (key, allowed, fallback) => {
+      const value = params.get(key);
+      return value && allowed.includes(value) ? value : fallback;
+    };
+    this.kindFilter = pick('kind', ['known', 'all', 'blocked', 'probe', 'other', 'allowed', 'exposed', 'observed'], this.kindFilter);
+    this.protoFilter = pick('proto', ['all', 'tcp', 'udp', 'icmp'], this.protoFilter);
+    this.timeFilter = pick('window', ['all', '5m', '15m', '1h', '6h', '24h'], this.timeFilter);
+    this.sortBy = pick('sort', ['time-desc', 'time-asc', 'source-asc', 'country-asc', 'port-asc'], this.sortBy);
+    this.initialQuery = params.get('q') || '';
+    const port = Number(params.get('port'));
+    if (Number.isInteger(port) && port >= 1 && port <= 65535) this.portFilter = port;
+    const country = String(params.get('country') || '').toUpperCase();
+    if (/^[A-Z]{2}$/.test(country)) this.countryFilter = country;
+    const asn = params.get('asn');
+    if (asn && asn.length <= 60) this.asnFilter = asn;
+    const src = params.get('src');
+    if (src && /^[0-9a-f:.]+$/i.test(src)) this.sourceFilter = src;
+  },
+
+  saveUrlState: function() {
+    if (!this.search) return;
+    try {
+      const params = new URLSearchParams(location.search);
+      const set = (key, value) => { if (value) params.set(key, value); else params.delete(key); };
+      set('kind', this.kindFilter !== 'known' ? this.kindFilter : '');
+      set('proto', this.protoFilter !== 'all' ? this.protoFilter : '');
+      set('window', this.timeFilter !== 'all' ? this.timeFilter : '');
+      set('sort', this.sortBy !== 'time-desc' ? this.sortBy : '');
+      set('q', this.search.value.trim());
+      set('port', this.portFilter != null ? String(this.portFilter) : '');
+      set('country', this.countryFilter);
+      set('asn', this.asnFilter);
+      set('src', this.sourceFilter);
+      const qs = params.toString();
+      history.replaceState(null, '', location.pathname + (qs ? '?' + qs : '') + location.hash);
+    }
+    catch (e) {}
+  },
+
+  copyViewLink: function() {
+    const url = location.href;
+    copyToClipboard(url)
+      .then(() => ui.addNotification(null, E('p', _('View link copied.')), 'info'))
+      .catch(() => ui.addNotification(null, E('p', _('Could not copy the link.')), 'error'));
   },
 
   saveFilterPreset: function() {
@@ -657,8 +746,6 @@ return view.extend({
       event.policyLabel = String(rule.label || marker);
       event.policyNote = String(rule.note || '');
     }
-    if ((marker === 'INFRA_PORT_HIT' || marker === 'INFRA_PORT_OTHER') && /logging-only match|does not by itself block/i.test(event.policyNote || ''))
-      event.policyNote = 'No allow or forward for this port. The watch logged the probe; the firewall default policy drops it.';
     event.baseKind = event.kind;
     event.basePolicyLabel = event.policyLabel;
     event.basePolicyNote = event.policyNote;
@@ -727,16 +814,19 @@ return view.extend({
     if (!this.watchStatusText) return;
     const config = this.watchConfig;
     if (!config) {
-      this.watchStatusText.textContent = _('WAN watch status unavailable · IPv4 only');
+      this.watchStatusText.textContent = _('WAN watch status unavailable');
       return;
     }
-    const active = config.active_interface || _('WAN interface unresolved');
     const count = String(config.ports || '').split(/[\s,]+/).filter(Boolean).length;
     const state = watchEnabled(config)
       ? (watchInstalled(config) ? _('active') : _('enabled · rules not detected'))
       : _('disabled');
+    const family = config.address_family || 'IPv4';
+    const scope = config.mode === 'probe'
+      ? _('probes · verdict unverified') + (config.active_interface ? ' · ' + config.active_interface : '')
+      : _('confirmed drops') + ' · ' + _('zone ') + (config.wan_zone || 'wan');
     const rate = config.log_rate ? ' · ' + config.log_rate : '';
-    this.watchStatusText.textContent = _('WAN watch ') + state + ' · IPv4 · ' + active + ' · ' + count + _(' ports') + rate;
+    this.watchStatusText.textContent = _('WAN watch ') + state + ' · ' + scope + ' · ' + family + ' · ' + count + _(' ports') + rate;
   },
 
   exportSettings: async function() {
@@ -745,7 +835,10 @@ return view.extend({
       schema: 'reffix-firewall-log-settings', version: 1,
       watcher: this.watchConfig ? {
         enabled: watchEnabled(this.watchConfig),
+        mode: this.watchConfig.mode === 'probe' ? 'probe' : 'verdict',
+        wan_zone: this.watchConfig.wan_zone || 'wan',
         wan_interface: this.watchConfig.wan_interface || 'auto',
+        ipv6: this.watchConfig.ipv6 === 0 || this.watchConfig.ipv6 === '0' ? 0 : 1,
         ports: this.watchConfig.ports || '',
         log_other_ports: this.watchConfig.log_other_ports === 1 || this.watchConfig.log_other_ports === '1' ? 1 : 0
       } : null,
@@ -782,13 +875,16 @@ return view.extend({
       }
       const presets = Array.isArray(browser.filterPresets) ? browser.filterPresets.filter(p =>
         p && typeof p.name === 'string' && typeof p.query === 'string' &&
-        ['known', 'all', 'blocked', 'other', 'observed', 'allowed', 'exposed'].includes(p.kind) &&
-        ['all', 'tcp', 'udp'].includes(p.proto) && ['all', '5m', '15m', '1h', '6h', '24h'].includes(p.window)
+        ['known', 'all', 'blocked', 'probe', 'other', 'observed', 'allowed', 'exposed'].includes(p.kind) &&
+        ['all', 'tcp', 'udp', 'icmp'].includes(p.proto) && ['all', '5m', '15m', '1h', '6h', '24h'].includes(p.window)
       ).slice(0, 20) : [];
       const watcher = data.watcher;
       if (watcher && (typeof watcher.enabled !== 'boolean' || typeof watcher.wan_interface !== 'string' ||
           !/^(auto|[a-zA-Z0-9_.:-]{1,32})$/.test(watcher.wan_interface) || typeof watcher.ports !== 'string' ||
-          watcher.ports.length > 4096 || /[^0-9,\s]/.test(watcher.ports))) {
+          watcher.ports.length > 4096 || /[^0-9,\s]/.test(watcher.ports) ||
+          (watcher.mode != null && !['verdict', 'probe'].includes(watcher.mode)) ||
+          (watcher.wan_zone != null && !/^[a-zA-Z0-9_]{1,16}$/.test(watcher.wan_zone)) ||
+          (watcher.ipv6 != null && ![0, 1, '0', '1', true, false].includes(watcher.ipv6)))) {
         ui.addNotification(null, E('p', _('Settings contain invalid WAN watch configuration.')), 'error'); return;
       }
       const summary = E('ul', {}, [
@@ -801,7 +897,10 @@ return view.extend({
         E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: async () => {
           try {
             if (watcher) {
-              const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', ['set', watcher.enabled ? '1' : '0', watcher.wan_interface, watcher.ports, watcher.log_other_ports ? '1' : '0'], 'text');
+              const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', ['set', watcher.enabled ? '1' : '0',
+                watcher.mode || 'verdict', watcher.wan_zone || 'wan', watcher.wan_interface,
+                watcher.ipv6 === 0 || watcher.ipv6 === '0' || watcher.ipv6 === false ? '0' : '1',
+                watcher.log_other_ports ? '1' : '0', watcher.ports], 'text');
               this.watchConfig = parseWatchConfig(raw);
               this.watchConfigLoaded = true;
               this.watchConfigSyncedAt = Date.now();
@@ -905,13 +1004,17 @@ return view.extend({
     const directory = E('input', {class: 'cbi-input-text', type: 'text', value: status.persist_directory || '/srv/log-viewer'});
     const days = E('input', {class: 'cbi-input-text', type: 'number', min: 1, max: 3650, value: String(status.persist_days || 7)});
     const maxMb = E('input', {class: 'cbi-input-text', type: 'number', min: 1, max: 8192, value: String(status.persist_max_mb || 32)});
+    const ring = E('input', {class: 'cbi-input-text', type: 'number', min: 100, max: 5000, value: String(status.cap || 500)});
     const error = E('p', {class: 'fw-modal-error', hidden: true, role: 'alert'});
+    const stats = E('p', {class: 'fw-help'}, _('Router memory: ') + (status.count != null ? status.count : '—') +
+      _(' of ') + (status.cap || 500) + _(' lines · ') +
+      (status.persist_enabled === 1 ? (status.persist_files || 0) + _(' files, ') + (status.persist_kb || 0) + ' KB' : _('disk history off')));
     const save = E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: async () => {
       error.hidden = true;
       save.disabled = true;
       try {
         const raw = await fs.exec_direct('/usr/sbin/log-viewer-history', [
-          'configure', enabled.checked ? '1' : '0', directory.value.trim(), days.value, maxMb.value
+          'configure', enabled.checked ? '1' : '0', directory.value.trim(), days.value, maxMb.value, ring.value
         ], 'text');
         this.routerHistoryStatus = parseWatchConfig(raw);
         this.routerHistorySyncedAt = Date.now();
@@ -924,7 +1027,7 @@ return view.extend({
               : _(' · disk history off'));
         }
         ui.hideModal();
-        ui.addNotification(null, E('p', _('Persistent history settings saved.')), 'info');
+        ui.addNotification(null, E('p', _('History settings saved. The collector restarted.')), 'info');
       }
       catch (e) {
         save.disabled = false;
@@ -932,8 +1035,9 @@ return view.extend({
         error.hidden = false;
       }
     }}, _('Save history settings'));
-    ui.showModal(_('Persistent history settings'), [
-      E('p', {class: 'cbi-section-descr'}, _('Opt in to writing new firewall lines to daily files on a mounted disk or USB path. The router memory ring always stays available. Use a mounted disk rather than internal flash to avoid unnecessary writes.')),
+    ui.showModal(_('History settings'), [
+      E('p', {class: 'cbi-section-descr'}, _('The router always keeps a small ring in RAM. Opt in to daily files on a mounted disk or USB path; use a mounted disk rather than internal flash.')),
+      stats,
       E('label', {class: 'fw-settings-field fw-watch-toggle'}, [enabled, E('span', {}, _('Enable persistent disk history'))]),
       E('div', {class: 'fw-watch-grid'}, [
         E('label', {class: 'fw-settings-field'}, [
@@ -947,10 +1051,17 @@ return view.extend({
           E('small', {}, _('Older daily files are pruned automatically.'))
         ])
       ]),
-      E('label', {class: 'fw-settings-field'}, [
-        E('span', {}, _('Maximum size (MB)')),
-        maxMb,
-        E('small', {}, _('Oldest daily files are removed when the directory grows past this limit.'))
+      E('div', {class: 'fw-watch-grid'}, [
+        E('label', {class: 'fw-settings-field'}, [
+          E('span', {}, _('Maximum size (MB)')),
+          maxMb,
+          E('small', {}, _('Oldest daily files are removed past this limit.'))
+        ]),
+        E('label', {class: 'fw-settings-field'}, [
+          E('span', {}, _('Lines kept in RAM')),
+          ring,
+          E('small', {}, _('100-5000. The ring survives page reloads, not reboots.'))
+        ])
       ]),
       error,
       E('div', {class: 'fw-modal-actions'}, [
@@ -966,7 +1077,7 @@ return view.extend({
     catch (e) {}
     const state = {
       offset: 0, limit: 100, total: 0, events: [], sort: 'time', order: 'desc',
-      verdict: 'all', protocol: 'all', port: '', source: '', search: ''
+      verdict: 'all', protocol: 'all', port: '', source: '', search: '', days: 0
     };
     const search = E('input', {class: 'cbi-input-text', type: 'search', placeholder: _('Search stored lines…'), 'aria-label': _('Search router history')});
     const verdict = E('select', {class: 'cbi-input-select', 'aria-label': _('Filter stored events by verdict')}, [
@@ -981,6 +1092,12 @@ return view.extend({
       E('option', {value: 'udp'}, 'UDP')
     ]);
     const port = E('input', {class: 'cbi-input-text', type: 'number', min: 1, max: 65535, placeholder: _('Port'), 'aria-label': _('Filter stored events by port')});
+    const days = E('select', {class: 'cbi-input-select', 'aria-label': _('Limit stored events by age')}, [
+      E('option', {value: '0'}, _('All stored days')),
+      E('option', {value: '1'}, _('Last 24 hours')),
+      E('option', {value: '7'}, _('Last 7 days')),
+      E('option', {value: '30'}, _('Last 30 days'))
+    ]);
     const sort = E('select', {class: 'cbi-input-select', 'aria-label': _('Sort stored events')}, [
       E('option', {value: 'time'}, _('Time')),
       E('option', {value: 'source'}, _('Source')),
@@ -1016,6 +1133,7 @@ return view.extend({
         '--protocol', state.protocol];
       if (state.port) args.push('--port', state.port);
       if (state.source) args.push('--source', state.source);
+      if (state.days) args.push('--days', String(state.days));
       if (state.search) args.push('--search', state.search);
       try {
         const raw = await fs.exec_direct('/usr/sbin/log-viewer-query', args, 'text');
@@ -1033,7 +1151,7 @@ return view.extend({
         render();
         counter.textContent = state.total
           ? _('Showing ') + (state.offset + 1) + '–' + Math.min(state.offset + state.events.length, state.total) +
-            _(' of ') + state.total
+            _(' of ') + state.total + (data.partial ? ' · ' + _('sorted the most recent 2,000 matches') : '')
           : _('No stored events match these filters.');
         prev.disabled = state.offset <= 0;
         next.disabled = state.offset + state.limit >= state.total;
@@ -1051,6 +1169,7 @@ return view.extend({
       searchTimer = setTimeout(() => { state.search = search.value.trim(); reload(); }, 150);
     });
     verdict.addEventListener('change', () => { state.verdict = verdict.value; reload(); });
+    days.addEventListener('change', () => { state.days = Number(days.value) || 0; reload(); });
     protocol.addEventListener('change', () => { state.protocol = protocol.value; reload(); });
     port.addEventListener('input', () => {
       clearTimeout(searchTimer);
@@ -1076,7 +1195,7 @@ return view.extend({
       E('p', {class: 'fw-help'}, persistent
         ? _('Disk history enabled · ') + (status.persist_files || 0) + _(' files · ') + (status.persist_kb || 0) + ' KB'
         : _('Disk history is off; this searches the router memory ring only.')),
-      E('div', {class: 'fw-history-controls'}, [search, verdict, protocol, port, sort, order]),
+      E('div', {class: 'fw-history-controls'}, [search, verdict, protocol, port, days, sort, order]),
       E('div', {class: 'fw-tablewrap fw-history-tablewrap'}, table),
       E('div', {class: 'fw-history-pager'}, [
         counter,
@@ -1093,13 +1212,24 @@ return view.extend({
   openTrafficSettings: async function() {
     await this.loadWatchConfig(true);
     const config = this.watchConfig;
+    const enabledValue = watchEnabled(config);
+    const modeValue = config && config.mode === 'probe' ? 'probe' : 'verdict';
+    const zoneValue = config && typeof config.wan_zone === 'string' && config.wan_zone ? config.wan_zone : 'wan';
     const wanValue = config && typeof config.wan_interface === 'string' && config.wan_interface ? config.wan_interface : 'auto';
     const portValue = config && typeof config.ports === 'string' ? config.ports : '';
-    const enabledValue = watchEnabled(config);
+    const ipv6Value = !config || !(config.ipv6 === false || config.ipv6 === 0 || config.ipv6 === '0');
 
-    const interfaces = E('input', {class: 'cbi-input-text', type: 'text', placeholder: _('auto or e.g. eth2'), value: wanValue});
     const watching = E('input', {type: 'checkbox'});
     watching.checked = enabledValue;
+    const mode = E('select', {class: 'cbi-input-select', 'aria-label': _('What to log')}, [
+      E('option', {value: 'verdict'}, _('Confirmed drops only')),
+      E('option', {value: 'probe'}, _('Every probe (verdict unverified)'))
+    ]);
+    mode.value = modeValue;
+    const zone = E('input', {class: 'cbi-input-text', type: 'text', value: zoneValue, placeholder: 'wan'});
+    const interfaces = E('input', {class: 'cbi-input-text', type: 'text', value: wanValue, placeholder: _('auto or e.g. pppoe-wan')});
+    const ipv6 = E('input', {type: 'checkbox'});
+    ipv6.checked = ipv6Value;
     const otherSample = E('input', {type: 'checkbox'});
     otherSample.checked = !!(config && (config.log_other_ports === 1 || config.log_other_ports === '1' || config.log_other_ports === true));
     const watchPorts = E('textarea', {class: 'cbi-input-text fw-port-list', rows: 7, placeholder: _('One port per line, or separated by commas/spaces'), value: portValue});
@@ -1107,20 +1237,49 @@ return view.extend({
     ports.value = Object.entries(this.exposedPorts).map(([port, label]) => port + ' = ' + label).join('\n');
     const error = E('p', {class: 'fw-modal-error', hidden: true, role: 'alert'});
     const note = E('p', {class: 'fw-help', hidden: true, role: 'status'});
+    const modeHint = E('p', {class: 'fw-help'});
+    const updateHint = () => {
+      modeHint.textContent = mode.value === 'verdict'
+        ? _('Rows are logged after every allow rule: the firewall evaluated the packet and the zone policy drops it. This is the accurate mode and it needs no WAN device name.')
+        : _('Rows are logged before filtering, so each one is a probe whose verdict is unknown. Useful to see attempts against forwarded ports.');
+    };
+    updateHint();
+    mode.addEventListener('change', updateHint);
+
     const status = config
       ? (watchEnabled(config)
         ? _('Enabled on this router') +
-          (config.active_interface ? _(' · active on ') + config.active_interface : '') +
+          (config.mode === 'probe'
+            ? (config.active_interface ? _(' · probe on ') + config.active_interface : _(' · probe mode'))
+            : _(' · confirmed drops on zone ') + (config.wan_zone || 'wan')) +
           (watchInstalled(config) ? _(' · rules installed') : _(' · rules not detected')) +
-          (otherSample.checked ? _(' · other-port sample on') : _(' · other-port sample off'))
+          (config.verdict === 'unknown' ? _(' · verdicts not observed') : '')
         : _('Disabled on this router.'))
       : _('Current WAN watch status is unavailable. Saving will configure it.');
+
+    const repair = E('button', {class: 'cbi-button', type: 'button', click: async () => {
+      repair.disabled = true;
+      try {
+        await fs.exec_direct('/usr/sbin/infra-port-watch', ['apply'], 'text');
+        await this.loadWatchConfig(true);
+        this.renderWatchStatus();
+        ui.addNotification(null, E('p', _('Watch rules re-applied.')), 'info');
+      }
+      catch (e) { ui.addNotification(null, E('p', _('Could not re-apply the rules: ') + (e.message || e)), 'error'); }
+      finally { repair.disabled = false; }
+    }}, _('Re-apply rules'));
 
     const saveButton = E('button', {class: 'cbi-button cbi-button-action important', type: 'button', click: async () => {
       error.hidden = true;
       note.hidden = true;
+      const wanZone = zone.value.trim() || 'wan';
+      if (!/^[a-zA-Z0-9_]{1,16}$/.test(wanZone)) {
+        error.textContent = _('Firewall zone names use letters, digits and underscores.');
+        error.hidden = false;
+        return;
+      }
       const wan = interfaces.value.trim() || 'auto';
-      if (!/^(auto|[a-zA-Z0-9_.:-]{1,64})$/.test(wan)) {
+      if (!/^(auto|[a-zA-Z0-9_.:-]{1,32})$/.test(wan)) {
         error.textContent = _('WAN interface may contain only letters, digits, dot, colon, underscore or dash.');
         error.hidden = false;
         return;
@@ -1153,7 +1312,8 @@ return view.extend({
       saveButton.disabled = true;
       try {
         const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', [
-          'set', watching.checked ? '1' : '0', wan, watchPorts.value, otherSample.checked ? '1' : '0'
+          'set', watching.checked ? '1' : '0', mode.value, wanZone, wan,
+          ipv6.checked ? '1' : '0', otherSample.checked ? '1' : '0', watchPorts.value
         ], 'text');
         this.watchConfig = parseWatchConfig(raw);
         this.watchConfigLoaded = true;
@@ -1200,27 +1360,37 @@ return view.extend({
     }}, _('Add missing default ports'));
 
     ui.showModal(_('WAN watch settings'), [
-      E('p', {class: 'cbi-section-descr'}, _('The watch logs matching TCP SYN and UDP probes only. It never accepts or drops traffic. Each source address has its own log budget, and forwarded ports use a smaller one. Only ports on the list are logged by default; the optional other-port sample is off. Auto resolves the logical WAN device. Router settings are saved here; service labels stay in this browser.')),
+      E('p', {class: 'cbi-section-descr'}, _('The watch only logs, it never accepts or drops traffic. Each source address has its own log budget.')),
       E('div', {class: 'fw-watch-status'}, status),
+      E('label', {class: 'fw-settings-field'}, [
+        E('span', {}, _('What to log')),
+        mode,
+        modeHint
+      ]),
       E('label', {class: 'fw-settings-field fw-watch-toggle'}, [watching, E('span', {}, _('Enable WAN port watch'))]),
-      E('label', {class: 'fw-settings-field fw-watch-toggle'}, [otherSample, E('span', {}, _('Also sample other ports (low rate)'))]),
-      E('p', {class: 'fw-help'}, _('Leave this off to see only the known port list. When on, unknown WAN ports are logged at 2 lines per minute per source and shown as Other.')),
       E('div', {class: 'fw-watch-grid'}, [
         E('label', {class: 'fw-settings-field'}, [
-          E('span', {}, _('WAN interface')),
-          interfaces,
-          E('small', {}, _('Use auto, or the device name shown in IN= (for example eth2).'))
+          E('span', {}, _('WAN firewall zone')),
+          zone,
+          E('small', {}, _('The zone whose input and forward chains are watched, usually wan.'))
         ]),
         E('label', {class: 'fw-settings-field'}, [
           E('span', {}, _('Ports to log')),
           watchPorts,
-          E('small', {}, _('1–65535, separated by commas or spaces, up to 256 ports.'))
+          E('small', {}, _('1-65535, separated by commas or spaces, up to 256 ports.'))
         ])
       ]),
-      E('div', {class: 'fw-settings-actions'}, [addDefaults]),
+      E('label', {class: 'fw-settings-field fw-watch-toggle'}, [ipv6, E('span', {}, _('Include IPv6'))]),
+      E('label', {class: 'fw-settings-field fw-watch-toggle'}, [otherSample, E('span', {}, _('Also sample other ports (low rate)'))]),
+      E('label', {class: 'fw-settings-field'}, [
+        E('span', {}, _('WAN device (probe mode only)')),
+        interfaces,
+        E('small', {}, _('Use auto, or the device shown in IN= (for example pppoe-wan).'))
+      ]),
+      E('div', {class: 'fw-settings-actions'}, [addDefaults, repair]),
       note,
       E('h5', {class: 'fw-section-heading'}, _('Service labels')),
-      E('p', {class: 'cbi-section-descr'}, _('Labels stay in this browser and rename watch hits from Blocked to Exposed. They do not change firewall rules.')),
+      E('p', {class: 'cbi-section-descr'}, _('Labels stay in this browser. In probe mode a labelled port is shown as Exposed instead of Probe.')),
       E('label', {class: 'fw-settings-field'}, [
         E('span', {}, _('Exposed destination ports')),
         ports,
@@ -1257,7 +1427,8 @@ return view.extend({
       const enabled = watchEnabled(config) ? '1' : '0';
       const other = config.log_other_ports === 1 || config.log_other_ports === '1' ? '1' : '0';
       const raw = await fs.exec_direct('/usr/sbin/infra-port-watch-config', [
-        'set', enabled, config.wan_interface || 'auto', next.ports, other
+        'set', enabled, config.mode || 'verdict', config.wan_zone || 'wan',
+        config.wan_interface || 'auto', config.ipv6 === 0 || config.ipv6 === '0' ? '0' : '1', other, next.ports
       ], 'text');
       this.watchConfig = parseWatchConfig(raw);
       this.watchConfigLoaded = true;
@@ -1293,7 +1464,7 @@ return view.extend({
         if (status.country_bytes) sizes.push(_('Country ') + formatBytes(status.country_bytes));
         if (status.asn_bytes) sizes.push(_('ASN ') + formatBytes(status.asn_bytes));
         if (sizes.length) detail.textContent = sizes.join(' · ');
-        if (status.state === 'done' || status.state === 'error') {
+        if (status.state === 'complete' || status.state === 'done' || status.state === 'error') {
           clearInterval(poll);
           poll = null;
           close.disabled = false;
@@ -1471,7 +1642,7 @@ return view.extend({
 
     const policyNotes = this.policyRules.length
       ? 'Local policy labels active: ' + this.policyRules.length
-      : 'Optional policy labels: copy the example config to /etc/log-viewer/policies.json and edit it for your rules.';
+      : 'Optional policy labels: edit /etc/log-viewer/policies.json to name your rules.';
     return '<div class="fw-insight fw-insight-timeline"><h3>Activity timeline</h3>' + timelineHtml +
         (this.timelineRange ? '<button type="button" class="cbi-button fw-clear-timeline">' + _('Clear timeline filter') + '</button>' : '<p class="fw-muted">' + _('Select a time bar to filter the event table.') + '</p>') + '</div>' +
       '<div class="fw-insight"><h3>Top sources</h3>' + topSources + '</div>' +
@@ -1480,7 +1651,7 @@ return view.extend({
       '<div class="fw-insight"><h3>Top ASNs</h3>' + topAsns + '</div>' +
       '<div class="fw-insight"><h3>Scan / burst signals</h3><p class="fw-muted">Heuristic only: 8+ ports or 25+ events from one public source.</p>' + scanHtml + '</div>' +
       '<div class="fw-insight fw-insight-policy"><h3>Policy context</h3><p class="fw-muted">' + esc(policyNotes) + '</p>' +
-      '<p class="fw-muted">A known-port probe is Blocked when nothing allows or forwards it. Other is an optional low-rate sample outside that list; it is off by default. Allowed appears only when an allow rule logs it.</p></div>';
+      '<p class="fw-muted">Blocked means the firewall evaluated the packet and the zone policy dropped it. Probes are logged before filtering, so their verdict is unverified. Allowed appears only when an allow rule logs it.</p></div>';
   },
 
 
@@ -1515,10 +1686,25 @@ return view.extend({
       const chunk = chunks[i];
       try {
         const raw = await fs.exec_direct('/usr/bin/flint4-geoip', ['--batch'].concat(chunk), 'text');
-        const data = JSON.parse(raw || '{}');
+        const byIp = new Map();
+        const text = String(raw || '').trim();
+        if (text.startsWith('{')) {
+          // 3.x helper returned one JSON object keyed by address.
+          const object = JSON.parse(text);
+          Object.keys(object).forEach(ip => byIp.set(ip, object[ip]));
+        }
+        else {
+          text.split('\n').filter(Boolean).forEach(line => {
+            try {
+              const row = JSON.parse(line);
+              if (row && row.ip) byIp.set(String(row.ip), row);
+            }
+            catch (e) {}
+          });
+        }
         chunk.forEach(ip => {
-          const row = data[ip] && !data[ip].error ? data[ip] : {};
-          this.rememberGeo(ip, row);
+          const row = byIp.get(ip);
+          this.rememberGeo(ip, row && !row.error ? row : {});
         });
       }
       catch (e) {
@@ -1705,7 +1891,8 @@ return view.extend({
   },
 
   getMatchingEvents: function(windowed) {
-    const query = (this.search.value || '').toLowerCase();
+    const query = parseQuery(this.search.value || '');
+    const now = this.routerNowMs();
     return (windowed || this.getWindowedEvents()).filter(e => {
       const geo = this.geoCache[e.source] || {};
       const searchable = [
@@ -1717,13 +1904,21 @@ return view.extend({
         (this.kindFilter === 'known'
           ? e.kind !== 'Other' && e.kind !== 'Observed'
           : e.kind.toLowerCase() === this.kindFilter);
-      return kindMatches &&
+      const textMatches = query.words.every(word => searchable.includes(word));
+      const queryMatches =
+        (query.port == null || Number(e.dport) === query.port) &&
+        (!query.country || String(geo.country_code || '').toUpperCase() === query.country) &&
+        (!query.asn || String(geo.asn_organization || '').toLowerCase().includes(query.asn)) &&
+        (!query.proto || e.protocol.toLowerCase() === query.proto) &&
+        (!query.verdict || e.kind.toLowerCase() === query.verdict) &&
+        (!query.source || e.source === query.source) &&
+        (!query.afterMs || (e.timestampMs && now - e.timestampMs <= query.afterMs));
+      return kindMatches && textMatches && queryMatches &&
         (this.protoFilter === 'all' || e.protocol.toLowerCase() === this.protoFilter) &&
         (!this.sourceFilter || e.source === this.sourceFilter) &&
         (!this.countryFilter || String(geo.country_code || '').toUpperCase() === this.countryFilter) &&
         (!this.asnFilter || String(geo.asn_organization || '') === this.asnFilter) &&
-        (this.portFilter == null || Number(e.dport) === Number(this.portFilter)) &&
-        searchable.includes(query);
+        (this.portFilter == null || Number(e.dport) === Number(this.portFilter));
     });
   },
 
@@ -1751,22 +1946,27 @@ return view.extend({
   renderEventRow: function(e) {
     const geo = this.geoCache[e.source] || {};
     const countryCode = (geo.country_code || '').toUpperCase();
-    const country = geo.country_name || 'GeoIP unavailable';
+    const country = geo.country_name || _('GeoIP unavailable');
     const asn = geo.asn_organization || '';
-    const kindClass = e.kind === 'Blocked' ? 'blocked' : (e.kind === 'Allowed' ? 'allowed' : (e.kind === 'Exposed' ? 'exposed' : (e.kind === 'Other' ? 'other' : 'observed')));
+    const kindClass = e.kind === 'Blocked' ? 'blocked' :
+      (e.kind === 'Probe' ? 'probe' :
+      (e.kind === 'Allowed' ? 'allowed' :
+      (e.kind === 'Exposed' ? 'exposed' :
+      (e.kind === 'Other' ? 'other' : 'observed'))));
     const policyText = e.policyLabel || e.marker || e.prefix;
-    const title = [e.marker || e.prefix, e.policyNote].filter(Boolean).join(' · ');
+    const verdictNote = e.verdictKnown === false ? ' · ' + _('verdict not observed') : '';
+    const title = [e.marker || e.prefix, e.policyNote].filter(Boolean).join(' · ') + verdictNote;
     return '<tr class="tr fw-' + kindClass + '" data-event-id="' + esc(e.id) + '">' +
-      '<td class="td fw-time">' + esc(e.timestamp) + '</td>' +
-      '<td class="td fw-source"><span class="fw-flag" title="' + esc(country) + '">' + countryFlag(countryCode) + '</span> ' +
+      '<td class="td fw-time" data-label="' + esc(_('Time')) + '">' + esc(e.timestamp) + '</td>' +
+      '<td class="td fw-source" data-label="' + esc(_('Source')) + '"><span class="fw-flag" title="' + esc(country) + '">' + countryFlag(countryCode) + '</span> ' +
         '<button type="button" class="fw-source-link" data-source="' + esc(e.source) + '" title="' + esc(_('Open source details')) + '"><code>' + esc(e.source) + '</code></button>' +
         '<small>' + esc(country) + (asn ? ' · ' + esc(asn) : '') + '</small></td>' +
-      '<td class="td"><code>' + esc(e.destination || '—') + '</code></td>' +
-      '<td class="td fw-port"><strong>' + esc(e.dport || '—') + '</strong><small>' + esc(e.service) + ' · ' + esc(e.protocol) + '</small></td>' +
-      '<td class="td"><span class="fw-badge ' + kindClass + '" title="' + esc(title) + '">' + esc(e.kind) + '</span><small class="fw-event-policy">' + esc(policyText || '—') + '</small></td>' +
-      '<td class="td fw-detail">SPT ' + esc(e.sport || '—') + ' · ' + esc(e.flags || '—') +
+      '<td class="td" data-label="' + esc(_('Destination')) + '"><code>' + esc(e.destination || '—') + '</code></td>' +
+      '<td class="td fw-port" data-label="' + esc(_('Port')) + '"><strong>' + esc(e.dport || '—') + '</strong><small>' + esc(e.service) + ' · ' + esc(e.protocol) + '</small></td>' +
+      '<td class="td" data-label="' + esc(_('Verdict')) + '"><span class="fw-badge ' + kindClass + '" title="' + esc(title) + '">' + esc(e.kind) + '</span><small class="fw-event-policy">' + esc(policyText || '—') + '</small></td>' +
+      '<td class="td fw-detail" data-label="' + esc(_('Packet')) + '">SPT ' + esc(e.sport || '—') + ' · ' + esc(e.flags || '—') +
         '<small>' + esc(e.iface || '—') + (e.ttl ? ' · TTL ' + esc(e.ttl) : '') + '</small></td>' +
-      '<td class="td"><button type="button" class="cbi-button fw-event-details" data-id="' + esc(e.id) + '">' + esc(_('Details')) + '</button>' +
+      '<td class="td" data-label="' + esc(_('Actions')) + '"><button type="button" class="cbi-button fw-event-details" data-id="' + esc(e.id) + '">' + esc(_('Details')) + '</button>' +
         (this.showReputation ? '<a class="fw-reputation" href="https://www.abuseipdb.com/check/' + encodeURIComponent(e.source) +
           '" target="_blank" rel="noreferrer" title="' + esc(_('Opens AbuseIPDB and shares this source IP with that service')) + '">' + esc(_('AbuseIPDB ↗')) + '</a>' : '') + '</td></tr>';
   },
@@ -1798,17 +1998,17 @@ return view.extend({
     this.filteredEvents = matching;
     const events = matching.slice(0, this.maxEntries);
     this.eventById = new Map(events.map(event => [String(event.id), event]));
-    let blocked = 0, allowed = 0, exposed = 0, other = 0;
+    let blocked = 0, allowed = 0, exposed = 0, probe = 0;
     matching.forEach(e => {
       if (e.kind === 'Blocked') blocked++;
       else if (e.kind === 'Allowed') allowed++;
       else if (e.kind === 'Exposed') exposed++;
-      else if (e.kind === 'Other') other++;
+      else if (e.kind === 'Probe') probe++;
     });
     this.stats.innerHTML = [
       ['MATCHING EVENTS', matching.length],
-      ['BLOCKED', blocked],
-      ['OTHER PORTS', other],
+      ['BLOCKED · CONFIRMED', blocked],
+      ['PROBES · UNVERIFIED', probe],
       ['EXPOSED SERVICE HITS', exposed],
       ['ALLOWED · EXPLICIT LOGS', allowed]
     ].map(function(item) {
@@ -1827,6 +2027,7 @@ return view.extend({
     this.loadMoreButton.hidden = events.length >= matching.length;
     this.loadMoreButton.textContent = _('Show ') + PAGE_SIZE + _(' more events · ') + (matching.length - events.length) + _(' remaining');
     this.renderChips(windowed);
+    this.saveUrlState();
   },
 
   renderChips: function(events) {
@@ -1866,7 +2067,7 @@ return view.extend({
     if (knownCount) items.push(chip(_('Known ports') + ' ' + knownCount, this.kindFilter === 'known', {
       'data-chip': 'kind', 'data-value': 'known'
     }));
-    ['Blocked', 'Other', 'Exposed', 'Allowed', 'Observed'].forEach(kind => {
+    ['Blocked', 'Probe', 'Other', 'Exposed', 'Allowed', 'Observed'].forEach(kind => {
       if ((kind === 'Other' || kind === 'Observed') && this.kindFilter === 'known') return;
       const count = verdicts.get(kind) || 0;
       if (count) items.push(chip(kind + ' ' + count, this.kindFilter === kind.toLowerCase(), {
@@ -1890,563 +2091,23 @@ return view.extend({
 
   render: function() {
     this.loadPreferences();
-    if (!document.getElementById('reffix-firewall-log-style')) document.head.appendChild(E('style', { id: 'reffix-firewall-log-style', type: 'text/css' }, `
-      .fw-shell {
-        --mp-bg: #2D2A2E;
-        --mp-panel: #221F22;
-        --mp-surface: #343136;
-        --mp-hover: #403E41;
-        --mp-border: #514D52;
-        --mp-fg: #FCFCFA;
-        --mp-muted: #C7C3C8;
-        --mp-yellow: #FFD866;
-        --mp-orange: #FC9867;
-        --mp-pink: #FF6188;
-        --mp-green: #A9DC76;
-        --mp-cyan: #78DCE8;
-        --mp-purple: #AB9DF2;
-        box-sizing: border-box;
-        width: 100%;
-        min-width: 0;
-        padding: 16px;
-        color: var(--mp-fg) !important;
-        background: var(--mp-bg) !important;
-        border: 1px solid var(--mp-border);
-        border-radius: 12px;
-        font-size: 14px;
-        line-height: 1.5;
-        color-scheme: dark;
-      }
-      .fw-shell * { box-sizing: border-box; }
-      .fw-modal {
-        --mp-bg: #2D2A2E;
-        --mp-panel: #221F22;
-        --mp-surface: #343136;
-        --mp-hover: #403E41;
-        --mp-border: #514D52;
-        --mp-fg: #FCFCFA;
-        --mp-muted: #C7C3C8;
-        --mp-yellow: #FFD866;
-        --mp-orange: #FC9867;
-        --mp-pink: #FF6188;
-        --mp-green: #A9DC76;
-        --mp-cyan: #78DCE8;
-        --mp-purple: #AB9DF2;
-        width: min(760px, 94vw);
-        max-height: 88vh;
-        overflow-y: auto;
-        color: var(--mp-fg);
-        background: var(--mp-bg);
-        color-scheme: dark;
-        text-align: left;
-      }
-      .fw-modal * { box-sizing: border-box; }
-      .fw-modal h4 { margin: 0 0 10px; color: var(--mp-fg); font-size: 17px; line-height: 1.3; }
-      .fw-modal .cbi-section-descr { margin: 0 0 8px; color: var(--mp-muted) !important; font-size: 13px !important; line-height: 1.6 !important; font-weight: 500; }
-      .fw-modal .fw-watch-status { margin: 10px 0 2px; padding: 9px 11px; color: var(--mp-muted); background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 8px; font-size: 12px; line-height: 1.5; }
-      .fw-modal .fw-watch-grid { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr); gap: 14px; align-items: start; }
-      .fw-modal .fw-settings-field { display: grid; gap: 6px; margin: 12px 0; color: var(--mp-fg); font-weight: 650; }
-      .fw-modal .fw-settings-field > span { font-size: 13px; }
-      .fw-modal .fw-settings-field small { color: var(--mp-muted); font-size: 12px; font-weight: 500; line-height: 1.45; }
-      .fw-modal .fw-watch-toggle { display: flex; align-items: center; gap: 9px; margin: 12px 0; }
-      .fw-modal .fw-watch-toggle input { width: 16px; height: 16px; margin: 0; }
-      .fw-modal .fw-check-field { display: flex; align-items: flex-start; gap: 9px; }
-      .fw-modal .fw-check-field input { width: 16px; height: 16px; margin: 2px 0 0; flex: 0 0 auto; }
-      .fw-modal input.cbi-input-text,
-      .fw-modal textarea.cbi-input-text {
-        width: 100%;
-        min-height: 38px;
-        margin: 0;
-        padding: 8px 10px;
-        color: var(--mp-fg) !important;
-        background: var(--mp-surface) !important;
-        border: 1px solid var(--mp-border) !important;
-        border-radius: 7px;
-        font: inherit;
-        font-size: 13px;
-        line-height: 1.5;
-      }
-      .fw-modal textarea.cbi-input-text { resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-      .fw-modal input.cbi-input-text:focus,
-      .fw-modal textarea.cbi-input-text:focus { outline: 2px solid var(--mp-purple); outline-offset: 1px; border-color: var(--mp-purple) !important; }
-      .fw-modal .fw-settings-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 2px; }
-      .fw-modal .fw-section-heading { margin: 18px 0 2px; padding-top: 14px; color: var(--mp-fg); border-top: 1px solid var(--mp-border); font-size: 14px; }
-      .fw-modal .fw-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--mp-border); position: sticky; bottom: -1px; background: var(--mp-bg); }
-      .fw-modal .fw-modal-error { margin: 10px 0 0; padding: 8px 10px; color: #FFD6E7; background: #4A2431; border: 1px solid #8B3E57; border-radius: 7px; font-size: 12px; line-height: 1.5; }
-      .fw-modal .fw-help { margin: 4px 0 0; color: var(--mp-muted); font-size: 12px; line-height: 1.5; }
-      .fw-details-modal { width: min(680px, 94vw); }
-      .fw-drawer-modal { position: fixed; top: 0; right: 0; left: auto; width: min(480px, 96vw); height: 100vh; max-height: 100vh; margin: 0; border-radius: 0; transform: none; }
-      .fw-drawer-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 10px 0 4px; }
-      .fw-drawer-summary > div { padding: 8px 10px; background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 7px; }
-      .fw-drawer-summary strong { display: block; color: var(--mp-fg); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
-      .fw-drawer-summary span { color: var(--mp-muted); font-size: 11px; }
-      .fw-drawer-meta { margin-top: 10px; }
-      .fw-drawer-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
-      .fw-drawer-events { display: grid; gap: 6px; }
-      .fw-drawer-event { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; width: 100%; padding: 7px 9px; color: var(--mp-fg); background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 7px; font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
-      .fw-drawer-event:hover { border-color: var(--mp-cyan); }
-      .fw-drawer-event-time { color: var(--mp-muted); font-size: 11px; }
-      .fw-modal .fw-muted { color: var(--mp-muted); font-size: 12px; }
-      .fw-modal .fw-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
-      .fw-modal .fw-chip { padding: 4px 9px; color: var(--mp-fg); background: var(--mp-surface); border: 1px solid var(--mp-border); border-radius: 999px; font-size: 12px; font-weight: 650; cursor: pointer; }
-      .fw-modal .fw-chip:hover { border-color: var(--mp-cyan); }
-      .fw-modal .fw-chip.active { color: var(--mp-bg); background: var(--mp-cyan); border-color: var(--mp-cyan); }
-      .fw-modal .fw-badge { display: inline-block; padding: 2px 6px; border: 1px solid transparent; border-radius: 4px; font-size: 11px; font-weight: 800; line-height: 1.35; white-space: nowrap; }
-      .fw-modal .fw-badge.blocked { color: #2D2A2E; background: var(--mp-pink); }
-      .fw-modal .fw-badge.other { color: #2D2A2E; background: var(--mp-orange); }
-      .fw-modal .fw-badge.observed { color: #2D2A2E; background: var(--mp-yellow); }
-      .fw-modal .fw-badge.allowed { color: #22251E; background: var(--mp-green); }
-      .fw-modal .fw-badge.exposed { color: #20232D; background: var(--mp-cyan); }
-      .fw-modal .fw-tablewrap { overflow: auto; border: 1px solid var(--mp-border); border-radius: 8px; }
-      .fw-modal .fw-table { width: 100%; min-width: 900px; border-collapse: separate; border-spacing: 0; background: var(--mp-bg); color: var(--mp-fg); font-size: 12px; }
-      .fw-modal .fw-table th { position: sticky; top: 0; z-index: 1; padding: 8px; color: var(--mp-fg); background: var(--mp-panel); border-bottom: 1px solid var(--mp-border); font-size: 11px; text-align: left; }
-      .fw-modal .fw-table td { padding: 7px 8px; color: var(--mp-fg); border-bottom: 1px solid var(--mp-border); vertical-align: top; }
-      .fw-modal .fw-table tbody tr:nth-child(even) { background: var(--mp-panel); }
-      .fw-modal .fw-table small { display: block; color: var(--mp-muted); font-size: 11px; font-weight: 400; }
-      .fw-modal .fw-source-link { padding: 0; color: inherit; background: none; border: 0; font: inherit; text-align: left; cursor: pointer; }
-      .fw-modal .fw-source-link code { color: var(--mp-fg); background: var(--mp-surface); border: 1px solid var(--mp-border); border-radius: 4px; padding: 1px 4px; font-size: 11px; }
-      .fw-modal .fw-source-link:hover code { border-color: var(--mp-cyan); }
-      .fw-history-modal { width: min(1180px, 96vw); }
-      .fw-history-settings-modal { width: min(680px, 94vw); }
-      .fw-geo-modal { width: min(640px, 94vw); }
-      .fw-geo-state { margin: 10px 0 8px; color: var(--mp-fg); font-size: 13px; font-weight: 700; }
-      .fw-geo-log { min-height: 40px; max-height: 180px; margin: 0; }
-      .fw-history-controls { display: grid; grid-template-columns: minmax(160px, 2fr) repeat(3, minmax(110px, 1fr)) repeat(2, minmax(90px, 0.8fr)); gap: 8px; margin: 10px 0; }
-      .fw-history-controls input,
-      .fw-history-controls select { width: 100%; min-height: 36px; }
-      .fw-history-tablewrap { max-height: 52vh; }
-      .fw-history-pager { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: center; margin-top: 10px; }
-      .fw-history-pager-buttons { display: flex; gap: 8px; }
-      @media (max-width: 800px) {
-        .fw-history-controls { grid-template-columns: 1fr 1fr; }
-      }
-      .fw-details-modal .fw-event-meta { margin-top: 4px; }
-      .fw-details-modal h3 { margin: 16px 0 6px; font-size: 13px; }
-      .fw-details-modal .fw-raw-log { margin: 0; padding: 10px; color: var(--mp-fg); background: var(--mp-panel); border: 1px solid var(--mp-border); border-radius: 7px; }
-      @media (max-width: 700px) {
-        .fw-modal .fw-watch-grid { grid-template-columns: 1fr; gap: 0; }
-      }
-      .fw-shell .fw-description {
-        color: var(--mp-muted) !important;
-        font-size: 13px !important;
-        line-height: 1.6 !important;
-        font-weight: 500;
-        margin: 0 0 14px;
-        max-width: 110ch;
-      }
-      .fw-shell .fw-stats {
-        display: grid;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
-        gap: 10px;
-        margin: 14px 0;
-      }
-      .fw-shell .fw-stat {
-        min-width: 0;
-        padding: 13px 14px;
-        background: var(--mp-panel) !important;
-        border: 1px solid var(--mp-border) !important;
-        border-radius: 9px;
-      }
-      .fw-shell .fw-stat span {
-        display: block;
-        color: var(--mp-muted) !important;
-        font-size: 11px !important;
-        font-weight: 800;
-        line-height: 1.35;
-        letter-spacing: .06em;
-        opacity: 1 !important;
-      }
-      .fw-shell .fw-stat strong {
-        display: block;
-        margin-top: 4px;
-        color: var(--mp-fg) !important;
-        font-size: 22px !important;
-        font-weight: 850;
-        line-height: 1.25;
-        font-variant-numeric: tabular-nums;
-      }
-      .fw-shell .fw-stat:nth-child(1) strong { color: var(--mp-cyan) !important; }
-      .fw-shell .fw-stat:nth-child(2) strong { color: var(--mp-pink) !important; }
-      .fw-shell .fw-stat:nth-child(3) strong { color: var(--mp-orange) !important; }
-      .fw-shell .fw-stat:nth-child(4) strong { color: var(--mp-cyan) !important; }
-      .fw-shell .fw-stat:nth-child(5) strong { color: var(--mp-green) !important; }
-
-      .fw-shell .fw-toolbar {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 8px;
-        margin: 12px 0;
-        color: var(--mp-muted) !important;
-        font-size: 13px !important;
-      }
-      .fw-shell .fw-toolbar input,
-      .fw-shell .fw-toolbar select {
-        min-width: 145px;
-        min-height: 38px !important;
-        padding: 7px 10px !important;
-        color: var(--mp-fg) !important;
-        background: var(--mp-surface) !important;
-        border: 1px solid var(--mp-border) !important;
-        border-radius: 7px !important;
-        box-shadow: none !important;
-        font-size: 13px !important;
-      }
-      .fw-shell .fw-toolbar input::placeholder { color: #B0AAB2 !important; opacity: 1; }
-      .fw-shell .fw-toolbar input:focus,
-      .fw-shell .fw-toolbar select:focus {
-        border-color: var(--mp-yellow) !important;
-        outline: 2px solid rgba(255,216,102,.22);
-        outline-offset: 1px;
-      }
-      .fw-shell .fw-toolbar button {
-        min-height: 38px !important;
-        padding: 7px 12px !important;
-        color: var(--mp-fg) !important;
-        background: var(--mp-hover) !important;
-        border: 1px solid #625B65 !important;
-        border-radius: 7px !important;
-        font-size: 13px !important;
-        font-weight: 700;
-        transition: background .12s ease, border-color .12s ease;
-      }
-      .fw-shell .fw-toolbar button:hover {
-        background: #4A454C !important;
-        border-color: var(--mp-purple) !important;
-      }
-      .fw-shell .fw-toolbar .cbi-button-action {
-        color: #221F22 !important;
-        background: var(--mp-yellow) !important;
-        border-color: var(--mp-yellow) !important;
-        font-weight: 850;
-      }
-      .fw-shell .fw-toolbar .cbi-button-action:hover {
-        background: #FFE59A !important;
-      }
-      .fw-shell .fw-toolbar .right {
-        color: var(--mp-muted) !important;
-        font-size: 12px !important;
-        font-variant-numeric: tabular-nums;
-      }
-      .fw-shell .fw-muted {
-        color: var(--mp-muted) !important;
-        font-size: 12px !important;
-        line-height: 1.55 !important;
-        opacity: 1 !important;
-      }
-
-      .fw-shell .fw-insights {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 10px;
-        margin: 12px 0 16px;
-      }
-      .fw-shell .fw-insight {
-        min-width: 0;
-        padding: 14px !important;
-        color: var(--mp-fg) !important;
-        background: var(--mp-panel) !important;
-        border: 1px solid var(--mp-border) !important;
-        border-radius: 10px !important;
-      }
-      .fw-shell .fw-insight h3 {
-        margin: 0 0 10px !important;
-        color: var(--mp-fg) !important;
-        font-size: 13px !important;
-        font-weight: 850 !important;
-        line-height: 1.35;
-        letter-spacing: .01em;
-      }
-      .fw-shell .fw-insight:nth-child(1) h3 { color: var(--mp-cyan) !important; }
-      .fw-shell .fw-insight:nth-child(2) h3 { color: var(--mp-orange) !important; }
-      .fw-shell .fw-insight:nth-child(3) h3 { color: var(--mp-purple) !important; }
-      .fw-shell .fw-insight:nth-child(4) h3 { color: var(--mp-yellow) !important; }
-      .fw-shell .fw-insight-list { list-style: none; margin: 0; padding: 0; }
-      .fw-shell .fw-insight-list li {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
-        gap: 4px 10px;
-        padding: 8px 0 !important;
-        color: var(--mp-fg) !important;
-        border-bottom: 1px solid #413C43 !important;
-        font-size: 13px !important;
-        line-height: 1.45 !important;
-      }
-      .fw-shell .fw-insight-list li:last-child { border-bottom: 0 !important; }
-      .fw-shell .fw-insight-list li > button {
-        display: grid; grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr) auto;
-        width: 100%; gap: 4px 10px; padding: 0; color: inherit; text-align: left;
-        background: transparent; border: 0; cursor: pointer;
-      }
-      .fw-shell .fw-insight-list li > button:hover code { border-color: var(--mp-cyan); }
-      .fw-shell .fw-insight-port { grid-column: 1 / -1 !important; }
-      .fw-shell .fw-insights-disclosure > summary { cursor: pointer; font-weight: 800; padding: 8px 2px; }
-      .fw-shell .fw-timeline { height: 96px; display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); align-items: end; gap: 3px; margin: 12px 0 4px; }
-      .fw-shell .fw-timeline-bin { min-width: 0; height: var(--fw-bar-height); min-height: 4px; padding: 0; color: var(--mp-bg); background: var(--mp-cyan); border: 1px solid transparent; border-radius: 3px 3px 0 0; cursor: pointer; }
-      .fw-shell .fw-timeline-bin.empty { background: var(--mp-surface); border-color: var(--mp-border); }
-      .fw-shell .fw-timeline-bin[aria-pressed="true"] { background: var(--mp-yellow); border-color: var(--mp-fg); }
-      .fw-shell .fw-timeline-bin span { display: block; overflow: hidden; color: var(--mp-bg); font-size: 9px; line-height: 1; }
-      .fw-shell .fw-timeline-labels { display: flex; justify-content: space-between; color: var(--mp-muted); font-size: 11px; }
-      .fw-shell .fw-insight-timeline { grid-column: 1 / -1; }
-      .fw-shell .fw-settings-field { display: grid; gap: 6px; margin: 12px 0; font-weight: 700; }
-      .fw-shell .fw-watch-toggle { display: flex; align-items: center; gap: 8px; }
-      .fw-shell .fw-settings-field textarea { resize: vertical; }
-      .fw-shell .fw-badge.exposed { color: #20232D !important; background: #78DCE8 !important; border-color: #A8EFF5 !important; }
-      .fw-shell .fw-insight-ip { display: flex; min-width: 0; align-items: center; gap: 5px; }
-      .fw-shell .fw-insight-ip code { overflow-wrap: anywhere; }
-      .fw-shell .fw-insight-list li span {
-        color: var(--mp-fg) !important;
-        font-size: 12px !important;
-        font-weight: 750;
-        white-space: nowrap;
-      }
-      .fw-shell .fw-insight-list li small {
-        grid-column: 1 / -1;
-        color: var(--mp-muted) !important;
-        font-size: 12px !important;
-        font-weight: 500;
-        line-height: 1.5 !important;
-        opacity: 1 !important;
-        overflow-wrap: anywhere;
-      }
-      .fw-shell .fw-insight-list code,
-      .fw-shell .fw-source code,
-      .fw-shell .fw-table code {
-        color: var(--mp-fg) !important;
-        background: var(--mp-surface) !important;
-        border: 1px solid #49434B;
-        border-radius: 4px;
-        padding: 2px 5px;
-        font-size: 12px !important;
-        font-weight: 700;
-      }
-      .fw-shell .fw-source-link { padding: 0; color: inherit; background: none; border: 0; font: inherit; text-align: left; cursor: pointer; }
-      .fw-shell .fw-source-link:hover code,
-      .fw-shell .fw-source-link:focus-visible code { border-color: var(--mp-cyan); }
-      .fw-shell .fw-signal {
-        padding: 3px 7px !important;
-        color: #FFE8B3 !important;
-        background: #51412A !important;
-        border: 1px solid #8C7040 !important;
-        border-radius: 5px;
-        font-size: 11px !important;
-        font-weight: 850;
-        white-space: nowrap;
-      }
-      .fw-shell .fw-insight-policy { grid-column: 1 / -1; }
-      .fw-shell .fw-status-row { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--mp-muted); font-size: 12px; }
-      .fw-shell .fw-file-import { position: relative; display: inline-flex; align-items: center; min-height: 38px; padding: 7px 12px; color: var(--mp-fg); background: var(--mp-hover); border: 1px solid #625B65; border-radius: 7px; cursor: pointer; }
-      .fw-shell .fw-file-import input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
-      .fw-shell .fw-file-import:focus-within { outline: 2px solid var(--mp-purple); outline-offset: 2px; }
-      .fw-shell .fw-history-toolbar { align-items: center; }
-      .fw-shell .fw-history-control { display: inline-flex; align-items: center; gap: 8px; }
-      .fw-shell .fw-privacy { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; color: var(--mp-muted); font-size: 12px; }
-      .fw-shell .fw-privacy input { margin-top: 3px; }
-      .fw-shell .fw-load-more { display: block; width: 100%; margin-top: 10px; }
-      .fw-shell .fw-event-details { margin-right: 8px; }
-      .fw-shell .fw-reputation { display: inline-block; margin-top: 8px; }
-      .fw-event-meta { display: grid; grid-template-columns: minmax(100px, auto) minmax(0, 1fr); gap: 6px 12px; }
-      .fw-event-meta dt { font-weight: 700; }
-      .fw-event-meta dd { margin: 0; overflow-wrap: anywhere; }
-      .fw-raw-log { max-height: 30vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-      .fw-shell .fw-event-policy {
-        display: block;
-        max-width: 18em;
-        margin-top: 3px;
-        color: var(--mp-muted) !important;
-        font-size: 11px !important;
-        line-height: 1.45;
-        opacity: 1 !important;
-        overflow-wrap: anywhere;
-      }
-
-      .fw-shell .fw-tablewrap {
-        max-height: 68vh;
-        overflow: auto;
-        background: var(--mp-panel) !important;
-        border: 1px solid var(--mp-border) !important;
-        border-radius: 10px !important;
-      }
-      .fw-shell .fw-table {
-        width: 100%;
-        min-width: 1000px;
-        border-collapse: separate;
-        border-spacing: 0;
-        background: var(--mp-bg) !important;
-        font-size: 13px !important;
-      }
-      .fw-shell .fw-table thead th {
-        position: sticky;
-        top: 0;
-        z-index: 2;
-        padding: 11px 10px !important;
-        color: var(--mp-fg) !important;
-        background: #403A42 !important;
-        border-bottom: 1px solid #645A67 !important;
-        font-size: 12px !important;
-        font-weight: 850 !important;
-        line-height: 1.4;
-        text-align: left;
-      }
-      .fw-shell .fw-table tbody tr { background: #302C32 !important; }
-      .fw-shell .fw-table tbody tr:nth-child(even) { background: #29262B !important; }
-      .fw-shell .fw-table tbody tr:hover { background: #403B43 !important; }
-      .fw-shell .fw-table tbody tr.fw-blocked { box-shadow: inset 3px 0 var(--mp-pink); }
-      .fw-shell .fw-table tbody tr.fw-other { box-shadow: inset 3px 0 var(--mp-orange); }
-      .fw-shell .fw-table tbody tr.fw-observed { box-shadow: inset 3px 0 var(--mp-yellow); }
-      .fw-shell .fw-table tbody tr.fw-allowed { box-shadow: inset 3px 0 var(--mp-green); }
-      .fw-shell .fw-table tbody tr.fw-exposed { box-shadow: inset 3px 0 var(--mp-cyan); }
-      .fw-shell .fw-table td {
-        padding: 10px !important;
-        color: var(--mp-fg) !important;
-        border-bottom: 1px solid #443E46 !important;
-        font-size: 13px !important;
-        font-weight: 500;
-        line-height: 1.5 !important;
-        vertical-align: top;
-      }
-      .fw-shell .fw-time {
-        min-width: 130px;
-        color: #E3DDE5 !important;
-        font-size: 12px !important;
-        white-space: nowrap;
-      }
-      .fw-shell .fw-source { min-width: 190px; }
-      .fw-shell .fw-source code {
-        color: #FFFFFF !important;
-        font-size: 13px !important;
-        font-weight: 800;
-        white-space: nowrap;
-      }
-      .fw-shell .fw-source small,
-      .fw-shell .fw-detail small,
-      .fw-shell .fw-table td:nth-child(4) small {
-        display: block;
-        margin-top: 4px;
-        color: var(--mp-muted) !important;
-        font-size: 12px !important;
-        font-weight: 500;
-        line-height: 1.5 !important;
-        opacity: 1 !important;
-      }
-      .fw-shell .fw-table td:nth-child(3) code {
-        color: var(--mp-cyan) !important;
-        white-space: nowrap;
-        display: inline-block;
-      }
-      .fw-shell .fw-table td:nth-child(3) { white-space: nowrap; }
-      .fw-shell .fw-table td:nth-child(4) strong { color: var(--mp-orange) !important; font-size: 14px; }
-      .fw-shell .fw-table a {
-        color: var(--mp-cyan) !important;
-        font-weight: 750;
-        text-decoration: none;
-      }
-      .fw-shell .fw-table a:hover { color: #B8F3F8 !important; text-decoration: underline; }
-      .fw-shell .fw-badge {
-        display: inline-block;
-        padding: 4px 8px !important;
-        border: 1px solid transparent;
-        border-radius: 5px !important;
-        font-size: 12px !important;
-        font-weight: 850 !important;
-        line-height: 1.35;
-        white-space: nowrap;
-      }
-      .fw-shell .fw-badge.observed {
-        color: #2D2A2E !important;
-        background: var(--mp-yellow) !important;
-        border-color: #FFE69A !important;
-      }
-      .fw-shell .fw-badge.other {
-        color: #2D2A2E !important;
-        background: var(--mp-orange) !important;
-        border-color: #FFC7A8 !important;
-      }
-      .fw-shell .fw-badge.blocked,
-      .fw-shell .fw-badge.danger {
-        color: #2D2A2E !important;
-        background: var(--mp-pink) !important;
-        border-color: #FFA0B8 !important;
-      }
-      .fw-shell .fw-badge.allowed {
-        color: #22251E !important;
-        background: var(--mp-green) !important;
-        border-color: #C5EBA1 !important;
-      }
-      .fw-shell .fw-flag { display: inline-flex; min-width: 22px; height: 16px; margin-right: 4px; align-items: center; justify-content: center; vertical-align: middle; }
-      .fw-shell .fw-flag-img { display: block; width: 20px; max-height: 15px; height: auto; object-fit: contain; border: 1px solid #514D52; border-radius: 2px; }
-      .fw-shell .fw-flag-fallback { font-size: 1.1em; line-height: 1; }
-      .fw-shell :focus-visible {
-        outline: 2px solid var(--mp-purple) !important;
-        outline-offset: 2px;
-      }
-      .fw-shell .fw-description { font-size: 13px !important; line-height: 1.5 !important; }
-      .fw-shell .fw-stats { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
-      .fw-shell .fw-stat span { font-size: 12px !important; }
-      .fw-shell .fw-stat strong { font-size: 22px !important; }
-      .fw-shell .fw-primary-toolbar { align-items: stretch; gap: 10px; margin: 14px 0 8px; }
-      .fw-shell .fw-primary-toolbar input,
-      .fw-shell .fw-primary-toolbar select { min-height: 36px; font-size: 13px !important; }
-      .fw-shell .fw-primary-toolbar input { flex: 2 1 240px; }
-      .fw-shell .fw-primary-toolbar select { flex: 1 1 145px; }
-      .fw-shell .fw-primary-toolbar button,
-      .fw-shell .fw-secondary-toolbar button,
-      .fw-shell .fw-history-toolbar button,
-      .fw-shell .fw-file-import { min-height: 36px !important; padding: 7px 12px !important; font-size: 13px !important; }
-      .fw-shell .fw-results-meta { display: flex; flex-wrap: wrap; gap: 5px 16px; margin: 8px 0 12px; color: var(--mp-muted); font-size: 13px !important; line-height: 1.5; }
-      .fw-shell .fw-results-meta .right { color: var(--mp-fg) !important; font-size: 13px !important; }
-      .fw-shell .fw-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 10px; }
-      .fw-shell .fw-chips[hidden] { display: none !important; }
-      .fw-shell .fw-chip { padding: 4px 9px; color: var(--mp-fg); background: var(--mp-surface); border: 1px solid var(--mp-border); border-radius: 999px; font-size: 12px; font-weight: 650; cursor: pointer; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .fw-shell .fw-chip:hover { border-color: var(--mp-cyan); }
-      .fw-shell .fw-chip.active { color: var(--mp-bg); background: var(--mp-cyan); border-color: var(--mp-cyan); }
-      .fw-shell .fw-more-actions { margin: 12px 0; border: 1px solid var(--mp-border); border-radius: 8px; background: var(--mp-panel); }
-      .fw-shell .fw-more-actions > summary { padding: 10px 12px; cursor: pointer; font-size: 13px; font-weight: 750; }
-      .fw-shell .fw-more-content { display: grid; gap: 0; padding: 0 14px 8px; }
-      .fw-shell .fw-settings-section { display: grid; gap: 8px; padding: 14px 0; border-top: 1px solid var(--mp-border); }
-      .fw-shell .fw-settings-section h3 { margin: 0; font-size: 13px; font-weight: 750; }
-      .fw-shell .fw-settings-section p { margin: 0; }
-      .fw-shell .fw-settings-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-      .fw-shell .fw-settings-actions select { min-width: 220px; min-height: 36px; font-size: 13px !important; }
-      .fw-shell .fw-insight-clear[hidden] { display: none !important; }
-      .fw-shell .fw-status-row,
-      .fw-shell .fw-history-toolbar,
-      .fw-shell .fw-privacy { font-size: 13px !important; line-height: 1.5; }
-      .fw-shell .fw-history-control select { min-height: 36px; font-size: 13px !important; }
-      .fw-shell .fw-insights-disclosure > summary { font-size: 13px; }
-      .fw-shell .fw-table { min-width: 960px; font-size: 13px !important; }
-      .fw-shell .fw-table thead th { padding: 10px 10px !important; font-size: 12px !important; }
-      .fw-shell .fw-table td { padding: 9px 10px !important; font-size: 13px !important; line-height: 1.45 !important; }
-      .fw-shell .fw-time { min-width: 150px; font-size: 12px !important; }
-      .fw-shell .fw-source { min-width: 210px; }
-      .fw-shell .fw-source code { font-size: 13px !important; }
-      .fw-shell .fw-source small,
-      .fw-shell .fw-detail small,
-      .fw-shell .fw-table td:nth-child(4) small { font-size: 12px !important; }
-      .fw-shell .fw-table code { font-size: 13px !important; }
-      .fw-shell .fw-event-policy { font-size: 12px !important; }
-      .fw-shell .fw-badge { padding: 3px 7px !important; font-size: 12px !important; }
-      .fw-shell .fw-event-details { min-height: 32px !important; padding: 5px 10px !important; font-size: 13px !important; }
-      .fw-shell .fw-load-more { min-height: 36px !important; margin-top: 12px; font-size: 13px !important; }
-      @media (max-width: 1200px) {
-        .fw-shell .fw-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      }
-      @media (max-width: 800px) {
-        .fw-shell { padding: 10px; }
-        .fw-shell .fw-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .fw-shell .fw-insights { grid-template-columns: 1fr; }
-        .fw-shell .fw-insight-policy { grid-column: auto; }
-        .fw-shell .fw-toolbar input,
-        .fw-shell .fw-toolbar select { flex: 1 1 140px; min-width: 0; }
-      }
-    `));
+    this.loadUrlState();
+    if (!document.getElementById('reffix-firewall-log-style')) {
+      document.head.appendChild(E('link', {
+        id: 'reffix-firewall-log-style',
+        rel: 'stylesheet',
+        type: 'text/css',
+        href: L.resource('log-viewer/firewall.css')
+      }));
+    }
 
     this.stats = E('div', {class: 'fw-stats'});
-    this.search = E('input', {class: 'cbi-input-text', type: 'search', placeholder: _('Search IP, country, ASN, port or service…'), 'aria-label': _('Search firewall events')});
+    this.search = E('input', {class: 'cbi-input-text', type: 'search', value: this.initialQuery || '', placeholder: _('Search, or try port:22 country:CN verdict:blocked'), 'aria-label': _('Search firewall events')});
     this.kind = E('select', {class: 'cbi-input-select', 'aria-label': _('Filter by verdict')}, [
       E('option', {value: 'known'}, _('Known ports only')),
       E('option', {value: 'all'}, _('All verdict types')),
-      E('option', {value: 'blocked'}, _('Blocked only')),
+      E('option', {value: 'blocked'}, _('Blocked · confirmed drop')),
+      E('option', {value: 'probe'}, _('Probes · verdict unverified')),
       E('option', {value: 'other'}, _('Other ports')),
       E('option', {value: 'exposed'}, _('Exposed service hits')),
       E('option', {value: 'observed'}, _('Other interface / unclassified')),
@@ -2456,8 +2117,10 @@ return view.extend({
     this.proto = E('select', {class: 'cbi-input-select', 'aria-label': _('Filter by protocol')}, [
       E('option', {value: 'all'}, _('All protocols')),
       E('option', {value: 'tcp'}, 'TCP'),
-      E('option', {value: 'udp'}, 'UDP')
+      E('option', {value: 'udp'}, 'UDP'),
+      E('option', {value: 'icmp'}, 'ICMP')
     ]);
+    this.proto.value = this.protoFilter;
     this.window = E('select', {class: 'cbi-input-select', title: _('Filter events by log timestamp'), 'aria-label': _('Filter by time window')}, [
       E('option', {value: 'all'}, _('All loaded')),
       E('option', {value: '5m'}, _('Last 5 minutes')),
@@ -2466,6 +2129,7 @@ return view.extend({
       E('option', {value: '6h'}, _('Last 6 hours')),
       E('option', {value: '24h'}, _('Last 24 hours'))
     ]);
+    this.window.value = this.timeFilter;
     this.presets = E('select', {class: 'cbi-input-select', title: _('Apply a filter you saved in this browser'), 'aria-label': _('Saved filter presets')});
     this.sort = E('select', {class: 'cbi-input-select', title: _('Sort the event table'), 'aria-label': _('Sort events')}, [
       E('option', {value: 'time-desc'}, _('Newest first')),
@@ -2595,7 +2259,13 @@ return view.extend({
     ]);
 
     const result = E('div', {class: 'fw-shell'}, [
-      E('p', {class: 'cbi-section-descr fw-description'}, _('Each row is one firewall event. A known-port probe is Blocked when nothing allows or forwards it. Other is an optional low-rate sample outside that list; it is off by default. Allowed requires an explicit ALLOW/ACCEPT log. GeoIP lookups stay local.')),
+      E('header', {class: 'fw-header'}, [
+        E('img', {class: 'fw-logo', src: L.resource('log-viewer/logo.svg'), alt: '', width: 40, height: 40}),
+        E('div', {}, [
+          E('h1', {class: 'fw-title'}, _('Firewall Log')),
+          E('p', {class: 'fw-description'}, _('Blocked WAN traffic as the firewall actually decided it, with local GeoIP enrichment. Probes are listed separately and marked unverified. Nothing leaves the router.'))
+        ])
+      ]),
       this.stats,
       E('div', {class: 'fw-toolbar fw-primary-toolbar'}, [
         this.search, this.kind, this.proto, this.window, this.sort,
@@ -2604,6 +2274,7 @@ return view.extend({
         this.deletePresetButton,
         E('button', {class: 'cbi-button cbi-button-action', click: () => this.refreshEvents().catch(e => ui.addNotification(null, E('p', e.message), 'error'))}, _('Refresh')),
         this.pauseButton,
+        E('button', {class: 'cbi-button', click: () => this.copyViewLink()}, _('Copy view link')),
         E('button', {class: 'cbi-button cbi-button-action fw-export-button', click: () => this.exportCSV(false)}, _('Export filtered CSV'))
       ]),
       this.chips,
@@ -2739,8 +2410,12 @@ return view.extend({
   showEventDetails: function(event) {
     const geo = this.geoCache[event.source] || {};
     const rows = [
-      ['Time', event.timestamp], ['Verdict', event.kind], ['Source IP', event.source],
-      ['Country', geo.country_name || 'GeoIP unavailable'], ['ASN', geo.asn_organization || '—'],
+      ['Time', event.timestamp], ['Verdict', event.kind],
+      ['Verdict source', event.verdictKnown === true
+        ? _('Confirmed by the firewall')
+        : _('Not observed (probe mode)')],
+      ['Source IP', event.source],
+      ['Country', geo.country_name || _('GeoIP unavailable')], ['ASN', geo.asn_organization || '—'],
       ['Destination IP', event.destination], ['Protocol', event.protocol],
       ['Source port', event.sport], ['Destination port', event.dport], ['Service', event.service],
       ['Interface', event.iface], ['TTL', event.ttl], ['Flags', event.flags],

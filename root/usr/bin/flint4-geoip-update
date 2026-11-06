@@ -1,12 +1,34 @@
 #!/bin/sh
-# Refresh local GeoLite2 Country and ASN databases. Validate downloads before replacement.
+# Refresh the local GeoLite2 Country and ASN databases.
+#
+# Downloads into a scratch directory, validates both files with mmdblookup(1),
+# then swaps them in. A lock prevents two browser tabs (or a scheduled run and
+# a manual run) from interleaving the two files. Optional SHA-256 pins can be
+# configured, because the default mirror is third-party infrastructure.
 set -eu
+
 BASE="${GEOIP_DB_DIR:-/usr/share/GeoIP}"
 TMPBASE="${GEOIP_UPDATE_TMP:-/tmp}"
 TMP="$TMPBASE/geolite-update.$$"
 STATUS="${GEOIP_UPDATE_STATUS:-/tmp/log-viewer/geoip-update.status}"
-mkdir -p "$BASE" "$TMP" "$(dirname "$STATUS")"
-trap 'rm -rf "$TMP"' EXIT INT TERM
+LOCK="${GEOIP_UPDATE_LOCK:-/tmp/log-viewer/geoip-update.lock}"
+URL="${GEOIP_URL:-https://github.com/P3TERX/GeoLite.mmdb/raw/download}"
+SHA_COUNTRY="${GEOIP_SHA256_COUNTRY:-}"
+SHA_ASN="${GEOIP_SHA256_ASN:-}"
+REQUIRED_MB="${GEOIP_REQUIRED_MB:-64}"
+
+uci_get() { uci -q get "$1" 2>/dev/null || true; }
+
+# UCI provides the persistent defaults; an environment variable still wins so
+# the test suite and one-off runs can point somewhere else.
+load_uci() {
+  command -v uci >/dev/null 2>&1 || return 0
+  [ -n "${GEOIP_DB_DIR:-}" ] || { v="$(uci_get log-viewer.geoip.directory)"; [ -n "$v" ] && BASE="$v"; }
+  [ -n "${GEOIP_URL:-}" ] || { v="$(uci_get log-viewer.geoip.url)"; [ -n "$v" ] && URL="$v"; }
+  [ -n "${GEOIP_SHA256_COUNTRY:-}" ] || { v="$(uci_get log-viewer.geoip.sha256_country)"; [ -n "$v" ] && SHA_COUNTRY="$v"; }
+  [ -n "${GEOIP_SHA256_ASN:-}" ] || { v="$(uci_get log-viewer.geoip.sha256_asn)"; [ -n "$v" ] && SHA_ASN="$v"; }
+}
+load_uci
 
 json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'
@@ -22,8 +44,9 @@ set_status() {
   country_bytes="${3:-0}"
   asn_bytes="${4:-0}"
   updated_at="$(date +%s 2>/dev/null || echo 0)"
-  printf '{"state":"%s","message":"%s","country_bytes":%s,"asn_bytes":%s,"updated_at":%s}\n' \
-    "$state" "$(json_escape "$message")" "$country_bytes" "$asn_bytes" "$updated_at" > "$STATUS.tmp" 2>/dev/null || true
+  printf '{"state":"%s","message":"%s","country_bytes":%s,"asn_bytes":%s,"updated_at":%s,"source":"%s"}\n' \
+    "$state" "$(json_escape "$message")" "$country_bytes" "$asn_bytes" "$updated_at" \
+    "$(json_escape "$URL")" > "$STATUS.tmp" 2>/dev/null || true
   mv "$STATUS.tmp" "$STATUS" 2>/dev/null || true
 }
 
@@ -33,43 +56,93 @@ fail() {
   exit 1
 }
 
+free_kb() {
+  df -k "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+require_space() {
+  dir="$1"
+  needed_kb=$((REQUIRED_MB * 1024))
+  available="$(free_kb "$dir")"
+  case "$available" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$available" -lt "$needed_kb" ]; then
+    fail "Not enough free space in $dir: ${available} KB available, about ${needed_kb} KB recommended."
+  fi
+  return 0
+}
+
+lock_take() {
+  mkdir -p "$(dirname "$LOCK")" 2>/dev/null || true
+  exec 9>"$LOCK" 2>/dev/null || return 0
+  command -v flock >/dev/null 2>&1 || return 0
+  flock -n 9 2>/dev/null || return 1
+}
+
 if [ "${1:-}" = "--status" ]; then
-  if [ -s "$STATUS" ]; then cat "$STATUS"; else printf '{"state":"idle","message":"No update has run yet.","country_bytes":0,"asn_bytes":0,"updated_at":0}\n'; fi
+  if [ -s "$STATUS" ]; then cat "$STATUS"; else printf '{"state":"idle","message":"No update has run yet.","country_bytes":0,"asn_bytes":0,"updated_at":0,"source":"%s"}\n' "$(json_escape "$URL")"; fi
   exit 0
 fi
 
-if ! command -v mmdblookup >/dev/null 2>&1; then
-  fail "Install libmaxminddb first (apk add libmaxminddb or opkg install libmaxminddb)."
+if [ -n "${1:-}" ] && [ "${1:-}" != "--quiet" ]; then
+  echo 'usage: flint4-geoip-update [--quiet|--status]' >&2
+  exit 2
 fi
+
+if ! lock_take; then
+  set_status busy "Another GeoIP update is already running." 0 0
+  echo 'Another GeoIP update is already running.' >&2
+  exit 1
+fi
+
+if ! command -v mmdblookup >/dev/null 2>&1; then
+  fail "Install libmaxminddb first (apk add libmaxminddb)."
+fi
+
+mkdir -p "$BASE" "$TMP" "$(dirname "$STATUS")" || fail "Could not create the update directories."
+trap 'rm -rf "$TMP"' EXIT INT TERM
+require_space "$TMPBASE"
+require_space "$BASE"
 
 fetch() {
   if command -v uclient-fetch >/dev/null 2>&1; then
-    uclient-fetch -O "$2" "$1"
+    uclient-fetch -q -O "$2" "$1"
   elif command -v wget >/dev/null 2>&1; then
-    wget -O "$2" "$1"
+    wget -q -O "$2" "$1"
   else
     echo "Need uclient-fetch or wget." >&2
     return 1
   fi
 }
 
-BASEURL=https://github.com/P3TERX/GeoLite.mmdb/raw/download
+sha256_of() {
+  sha256sum "$1" 2>/dev/null | awk '{ print $1 }'
+}
+
 set_status downloading "Downloading GeoLite2 Country database…" 0 0
-fetch "$BASEURL/GeoLite2-Country.mmdb" "$TMP/GeoLite2-Country.mmdb" || fail "Could not download the GeoLite2 Country database."
+fetch "$URL/GeoLite2-Country.mmdb" "$TMP/GeoLite2-Country.mmdb" || fail "Could not download the GeoLite2 Country database."
 set_status downloading "Downloaded Country; downloading ASN database…" "$(file_size "$TMP/GeoLite2-Country.mmdb")" 0
-fetch "$BASEURL/GeoLite2-ASN.mmdb" "$TMP/GeoLite2-ASN.mmdb" || fail "Could not download the GeoLite2 ASN database."
+fetch "$URL/GeoLite2-ASN.mmdb" "$TMP/GeoLite2-ASN.mmdb" || fail "Could not download the GeoLite2 ASN database."
 set_status validating "Downloaded both databases; validating…" "$(file_size "$TMP/GeoLite2-Country.mmdb")" "$(file_size "$TMP/GeoLite2-ASN.mmdb")"
 
 if [ ! -s "$TMP/GeoLite2-Country.mmdb" ] || [ ! -s "$TMP/GeoLite2-ASN.mmdb" ]; then
-  fail "GeoIP download is empty; keeping current database files."
+  fail "GeoIP download is empty; keeping the current database files."
 fi
 
-# 1.1.1.1 is anycast and may lack country.iso_code in some GeoLite records.
-# Use a well-known ordinary unicast IP to validate both database lookup paths.
-if ! mmdblookup --file "$TMP/GeoLite2-Country.mmdb" --ip 8.8.8.8 country iso_code >/dev/null; then
+if [ -n "$SHA_COUNTRY" ]; then
+  actual="$(sha256_of "$TMP/GeoLite2-Country.mmdb")"
+  [ "$actual" = "$SHA_COUNTRY" ] || fail "Country database checksum mismatch (expected $SHA_COUNTRY)."
+fi
+if [ -n "$SHA_ASN" ]; then
+  actual="$(sha256_of "$TMP/GeoLite2-ASN.mmdb")"
+  [ "$actual" = "$SHA_ASN" ] || fail "ASN database checksum mismatch (expected $SHA_ASN)."
+fi
+
+# 8.8.8.8 is an ordinary unicast address whose records exist in both databases.
+# 1.1.1.1 is anycast and lacks country.iso_code in some GeoLite builds.
+if ! mmdblookup --file "$TMP/GeoLite2-Country.mmdb" --ip 8.8.8.8 country iso_code >/dev/null 2>&1; then
   fail "Downloaded Country database failed validation."
 fi
-if ! mmdblookup --file "$TMP/GeoLite2-ASN.mmdb" --ip 8.8.8.8 autonomous_system_organization >/dev/null; then
+if ! mmdblookup --file "$TMP/GeoLite2-ASN.mmdb" --ip 8.8.8.8 autonomous_system_organization >/dev/null 2>&1; then
   fail "Downloaded ASN database failed validation."
 fi
 
@@ -78,5 +151,5 @@ cp "$TMP/GeoLite2-Country.mmdb" "$BASE/GeoLite2-Country.mmdb.new" || fail "Could
 cp "$TMP/GeoLite2-ASN.mmdb" "$BASE/GeoLite2-ASN.mmdb.new" || fail "Could not stage the ASN database."
 mv "$BASE/GeoLite2-Country.mmdb.new" "$BASE/GeoLite2-Country.mmdb" || fail "Could not replace the Country database."
 mv "$BASE/GeoLite2-ASN.mmdb.new" "$BASE/GeoLite2-ASN.mmdb" || fail "Could not replace the ASN database."
-set_status done "GeoLite2 Country and ASN databases updated." "$(file_size "$BASE/GeoLite2-Country.mmdb")" "$(file_size "$BASE/GeoLite2-ASN.mmdb")"
-echo "GeoLite2 Country and ASN databases updated."
+set_status complete "GeoLite2 Country and ASN databases updated." "$(file_size "$BASE/GeoLite2-Country.mmdb")" "$(file_size "$BASE/GeoLite2-ASN.mmdb")"
+[ "${1:-}" = "--quiet" ] || echo "GeoLite2 Country and ASN databases updated."
