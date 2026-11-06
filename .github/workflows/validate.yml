@@ -62,7 +62,8 @@ jobs:
           cc -fsyntax-only -Wall -Wextra src/log-viewer-geoip.c
 
       - name: nftables rulesets parse
-        continue-on-error: true
         run: |
           sudo apt-get install -y -qq nftables
-          sh tests/nft-parse.sh
+          # nft -c initialises the netlink cache, which needs privileges even
+          # though it never commits the ruleset.
+          sudo sh tests/nft-parse.sh
