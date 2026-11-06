@@ -135,9 +135,13 @@ test('a missing GeoIP database is shown as off, not as a silent blank', () => {
   assert.match(source, /fw-geo-banner/);
   assert.match(source, /this\.geoBanner\.hidden = available/);
   assert.match(source, /GeoIP is off: no local databases are installed/);
-  assert.match(source, /GeoIP off · no local databases/);
+  assert.match(source, /GeoIP off · /);
+  assert.match(source, /const reason = this\.geoStatus && this\.geoStatus\.reason/);
   assert.match(source, /_\('GeoIP off'\)/);
   assert.match(source, /GeoIP lookups are failing: /);
+  assert.match(source, /this\.geoStatus\.reason/);
+  assert.match(source, /this\.geoBannerText/);
+  assert.match(source, /GeoIP is off: /);
   assert.match(css, /\.fw-geo-banner/);
 });
 

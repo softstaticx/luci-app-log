@@ -1,5 +1,20 @@
 # Changelog
 
+## v4.0.3 (2026-11-06)
+
+### GeoIP diagnostics
+
+- `flint4-geoip --status` now performs one real lookup against the country
+  database and reports a `reason`: `no database`, `mmdblookup missing` or
+  `database unreadable`. A truncated file is no longer reported as available.
+- A lookup without a database or without `mmdblookup` returns an explicit
+  `{"error":"no database"}` / `{"error":"no mmdblookup"}` record instead of an
+  empty object, so the page can explain itself.
+- The GeoIP banner uses that reason (`GeoIP off · no database`, …) and points at
+  the update button.
+- Shell tests cover missing, corrupt and unreadable database states, and each
+  test case now starts from a clean environment.
+
 ## v4.0.2 (2026-11-06)
 
 ### GeoIP

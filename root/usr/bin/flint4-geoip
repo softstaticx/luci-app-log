@@ -66,6 +66,16 @@ emit() {
     printf '{"ip":"%s","error":"invalid ip"}\n' "$(json_escape "$ip")"
     return 0
   fi
+  # Say why a lookup produced nothing, so the page can distinguish "no data"
+  # from "not configured" instead of showing an empty row.
+  if ! command -v mmdblookup >/dev/null 2>&1; then
+    printf '{"ip":"%s","error":"no mmdblookup"}\n' "$(json_escape "$ip")"
+    return 0
+  fi
+  if [ ! -s "$country_db" ] && [ ! -s "$asn_db" ]; then
+    printf '{"ip":"%s","error":"no database"}\n' "$(json_escape "$ip")"
+    return 0
+  fi
   lookup_ip "$ip"
   printf '{"ip":"%s","country_code":"%s","country_name":"%s","asn":"%s","asn_organization":"%s"}\n' \
     "$(json_escape "$ip")" "$(json_escape "$cc")" "$(json_escape "$country")" \
@@ -76,30 +86,43 @@ status() {
   available=false
   age_days=null
   stale=false
+  reason=""
   country_bytes=0
   asn_bytes=0
   if [ -s "$country_db" ]; then country_bytes="$(stat -c %s "$country_db" 2>/dev/null || echo 0)"; fi
   if [ -s "$asn_db" ]; then asn_bytes="$(stat -c %s "$asn_db" 2>/dev/null || echo 0)"; fi
   case "$country_bytes" in ''|*[!0-9]*) country_bytes=0 ;; esac
   case "$asn_bytes" in ''|*[!0-9]*) asn_bytes=0 ;; esac
-  if [ -s "$country_db" ] && command -v mmdblookup >/dev/null 2>&1; then
-    country_time="$(stat -c %Y "$country_db" 2>/dev/null || echo 0)"
-    case "$country_time" in ''|*[!0-9]*) country_time=0 ;; esac
-    older_time="$country_time"
-    if [ -s "$asn_db" ]; then
-      asn_time="$(stat -c %Y "$asn_db" 2>/dev/null || echo 0)"
-      case "$asn_time" in ''|*[!0-9]*) asn_time=0 ;; esac
-      [ "$asn_time" -ge "$older_time" ] || older_time="$asn_time"
+  if [ -s "$country_db" ]; then
+    if ! command -v mmdblookup >/dev/null 2>&1; then
+      reason="mmdblookup missing"
+    else
+      country_time="$(stat -c %Y "$country_db" 2>/dev/null || echo 0)"
+      case "$country_time" in ''|*[!0-9]*) country_time=0 ;; esac
+      older_time="$country_time"
+      if [ -s "$asn_db" ]; then
+        asn_time="$(stat -c %Y "$asn_db" 2>/dev/null || echo 0)"
+        case "$asn_time" in ''|*[!0-9]*) asn_time=0 ;; esac
+        [ "$asn_time" -ge "$older_time" ] || older_time="$asn_time"
+      fi
+      now="$(date +%s 2>/dev/null || echo 0)"
+      if [ "$older_time" -gt 0 ] && [ "$now" -ge "$older_time" ]; then
+        age_days=$(( (now - older_time) / 86400 ))
+        [ "$age_days" -le 45 ] || stale=true
+      fi
+      available=true
+      # A file can exist and still be truncated or corrupt. One real lookup is
+      # cheap and stops the page from reporting GeoIP as ready when it is not.
+      if ! mmdblookup --file "$country_db" --ip 8.8.8.8 country iso_code >/dev/null 2>&1; then
+        available=false
+        reason="database unreadable"
+      fi
     fi
-    now="$(date +%s 2>/dev/null || echo 0)"
-    if [ "$older_time" -gt 0 ] && [ "$now" -ge "$older_time" ]; then
-      age_days=$(( (now - older_time) / 86400 ))
-      [ "$age_days" -le 45 ] || stale=true
-    fi
-    available=true
+  else
+    reason="no database"
   fi
-  printf '{"available":%s,"age_days":%s,"stale":%s,"country_bytes":%s,"asn_bytes":%s,"database_dir":"%s"}\n' \
-    "$available" "$age_days" "$stale" "$country_bytes" "$asn_bytes" "$(json_escape "$DB_DIR")"
+  printf '{"available":%s,"reason":"%s","age_days":%s,"stale":%s,"country_bytes":%s,"asn_bytes":%s,"database_dir":"%s"}\n' \
+    "$available" "$(json_escape "$reason")" "$age_days" "$stale" "$country_bytes" "$asn_bytes" "$(json_escape "$DB_DIR")"
 }
 
 case "${1:-}" in

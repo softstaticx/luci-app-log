@@ -11,6 +11,7 @@ set -u
 # shellcheck disable=SC1007
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SUPPORT="$ROOT/tests/support"
+BASE_PATH="${PATH:-/usr/bin:/bin}"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/lv-tests.XXXXXX") || exit 1
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
@@ -52,6 +53,10 @@ json_ok() {
 # ------------------------------------------------------------------ setup ---
 
 new_env() {
+	# Each case starts from a clean environment; PATH and exported GeoIP
+	# settings from a previous group must not leak into the next one.
+	unset LOG_VIEWER_GEOIP_HELPER GEOIP_DB_DIR GEOIP_UPDATE_TMP GEOIP_UPDATE_STATUS GEOIP_UPDATE_LOCK
+	unset GEOIP_SHA256_COUNTRY GEOIP_SHA256_ASN FAKE_COUNTRY_FILE FAKE_ASN_FILE FAKE_FETCH_FAIL
 	env_dir="$WORK/$1"
 	mkdir -p "$env_dir/bin" "$env_dir/nft" "$env_dir/include" "$env_dir/data"
 	: > "$env_dir/uci"
@@ -72,7 +77,7 @@ new_env() {
 	export LOG_VIEWER_WATCH_INIT="$env_dir/fw4-init"
 	export LOG_VIEWER_WATCH_BIN="$ROOT/root/usr/sbin/infra-port-watch"
 	export LOG_VIEWER_TMP="$env_dir/data"
-	PATH="$env_dir/bin:$PATH"
+	PATH="$env_dir/bin:$BASE_PATH"
 	export PATH
 }
 
@@ -403,7 +408,34 @@ check "lookup survives an empty geoip section" equals "$?" "0"
 check "lookup still answers the address" has "$L/data/out.ndjson" '"country_code":"DE"'
 check "lookup prints one line" equals "$(wc -l < "$L/data/out.ndjson" | tr -d ' ')" "1"
 
+group "geoip: missing and unreadable databases are reported, not blank"
+new_env geoipnone
+N="$env_dir"
+mkdir -p "$N/data/none"
+cp "$SUPPORT/fake-mmdblookup" "$env_dir/bin/mmdblookup"
+chmod +x "$env_dir/bin/mmdblookup"
+GEOIP_DB_DIR="$N/data/none" sh "$ROOT/root/usr/bin/flint4-geoip" --status > "$N/data/status.json" 2>/dev/null
+check "missing databases are unavailable" has "$N/data/status.json" '"available":false'
+check "missing databases give a reason" has "$N/data/status.json" '"reason":"no database"'
+GEOIP_DB_DIR="$N/data/none" sh "$ROOT/root/usr/bin/flint4-geoip" --batch 1.2.3.4 > "$N/data/batch.ndjson" 2>/dev/null
+check "a lookup without databases explains itself" has "$N/data/batch.ndjson" '"error":"no database"'
+
+new_env geoipbad
+B="$env_dir"
+mkdir -p "$B/data/db"
+printf 'truncated' > "$B/data/db/GeoLite2-Country.mmdb"
+printf '#!/bin/sh\nexit 1\n' > "$B/bin/mmdblookup"
+chmod +x "$B/bin/mmdblookup"
+GEOIP_DB_DIR="$B/data/db" sh "$ROOT/root/usr/bin/flint4-geoip" --status > "$B/data/status.json" 2>/dev/null
+check "a corrupt database is not reported as available" has "$B/data/status.json" '"available":false'
+check "a corrupt database gives a reason" has "$B/data/status.json" '"database unreadable"'
+
+group "geoip: the page turns the status reason into a banner"
+check "the view reads the status reason" grep -qF "geoStatus.reason" "$ROOT/htdocs/luci-static/resources/view/log-viewer/firewall.js"
+check "the view has a banner text element" grep -qF "geoBannerText" "$ROOT/htdocs/luci-static/resources/view/log-viewer/firewall.js"
+
 # -------------------------------------------------------------- migration ---
+
 
 
 group "upgrade: 3.x configuration migrates without losing settings"

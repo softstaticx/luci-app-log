@@ -2035,7 +2035,10 @@ return view.extend({
     if (this.geoBanner) this.geoBanner.hidden = available;
     const failure = this.geoLookupError ? ' · ' + _('lookup failed: ') + this.geoLookupError : '';
     if (!available) {
-      this.geoStatusText.textContent = _('GeoIP off · no local databases') + failure;
+      const reason = this.geoStatus && this.geoStatus.reason ? String(this.geoStatus.reason) : _('no local databases');
+      this.geoStatusText.textContent = _('GeoIP off · ') + reason + failure;
+      if (this.geoBannerText)
+        this.geoBannerText.textContent = _('GeoIP is off: ') + reason + _('. Update the databases, then reload this page.');
       return;
     }
     const age = this.geoStatus.age_days == null ? _('age unknown') : this.geoStatus.age_days + _(' days old');
@@ -2319,7 +2322,7 @@ return view.extend({
         ])
       ]),
       (this.geoBanner = E('div', {class: 'fw-geo-banner', hidden: true, role: 'status'}, [
-        E('span', {}, _('GeoIP is off: no local databases are installed, so country and ASN stay empty.')),
+        (this.geoBannerText = E('span', {}, _('GeoIP is off: no local databases are installed, so country and ASN stay empty.'))),
         E('button', {class: 'cbi-button cbi-button-action', type: 'button', click: () => {
           this.updateGeoDatabases().catch(e => ui.addNotification(null, E('p', e.message || e), 'error'));
         }}, _('Update GeoIP databases'))

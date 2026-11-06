@@ -1,33 +1,24 @@
-# luci-app-log v4.0.2
+# luci-app-log v4.0.3
 
 OpenWrt 25.12 patch release. The package name remains `luci-app-log-viewer`.
 
-## Why this release exists
+## What this release is for
 
-After 4.0.1 the updater works, but the page could still show **GeoIP unavailable**
-on every row while one old row kept its country. That happens when the native
-lookup helper produces no output: the wrapper used to `exec` it, so a broken or
-missing helper turned every address into a silent miss, and the page could not
-tell "no data" from "GeoIP is not set up".
+4.0.2 made a broken lookup helper fall back to `mmdblookup` and added a GeoIP
+banner. 4.0.3 makes the remaining failures say what is wrong, instead of showing
+blank rows.
 
-## What changed
+- `flint4-geoip --status` now checks the country database with a real lookup and
+  returns a `reason`: `no database`, `mmdblookup missing` or
+  `database unreadable`. A truncated `.mmdb` is no longer reported as ready.
+- Lookups without a database return an explicit error record, so the page shows
+  **GeoIP off · no database** (or the matching reason) and the banner explains
+  what to do.
+- The test suite covers missing, corrupt and unreadable database states.
 
-- The wrapper now captures the helper's output and falls back to `mmdblookup(1)`
-  for the batch when it is empty. A broken helper costs speed, not data.
-- No databases installed? The page says **GeoIP off** and shows a banner with an
-  **Update GeoIP databases** button, instead of leaving every row blank.
-- Failing lookups are reported once with the real reason instead of being cached
-  as empty.
-- A successful update clears the empty cache and fills the table immediately.
+## If GeoIP is still off
 
-## If you still see GeoIP off
-
-1. Upgrade to 4.0.2.
-2. **Settings → Files → Update GeoIP databases** (or the banner button).
-3. If it reports a failure, the dialog now shows the reason, and the same text is
-   in `/tmp/log-viewer/geoip-update.status`.
-
-Quick check from a shell:
+Run these on the router and compare:
 
 ```sh
 /usr/bin/flint4-geoip --status
@@ -35,9 +26,15 @@ Quick check from a shell:
 ls -l /usr/share/GeoIP
 ```
 
-`--status` must report `"available":true` and the batch must return a line with
-a `country_code`. If the batch is empty, `mmdblookup` is missing
-(`apk add libmaxminddb`) or the databases are absent (run the update).
+| Output | Meaning | Fix |
+| --- | --- | --- |
+| `"available":false,"reason":"no database"` | No `.mmdb` files | Update the databases |
+| `"reason":"mmdblookup missing"` | `libmaxminddb` is not installed | `apk add libmaxminddb` |
+| `"reason":"database unreadable"` | A file is truncated or corrupt | Update the databases again |
+| `"available":true` but the batch line has `"error"` | The helper could not read the files | Update the databases; the wrapper falls back to `mmdblookup` |
+| Batch prints `country_code` | Lookups work; reload the page | — |
+
+The last update message is always in `/tmp/log-viewer/geoip-update.status`.
 
 ## Upgrading
 
