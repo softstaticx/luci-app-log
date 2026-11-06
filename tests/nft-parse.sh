@@ -12,7 +12,9 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/lv-nft.XXXXXX") || exit 1
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
-command -v nft >/dev/null 2>&1 || { echo 'nft not installed; skipping'; exit 0; }
+# Resolve the real binary before the fake nft is placed on PATH.
+REAL_NFT=$(command -v nft || true)
+[ -n "$REAL_NFT" ] || { echo 'nft not installed; skipping'; exit 0; }
 
 ENV_DIR="$WORK/env"
 mkdir -p "$ENV_DIR/bin" "$ENV_DIR/nft" "$ENV_DIR/include"
@@ -40,7 +42,7 @@ printf '%s\n' \
   'infra-port-watch.main.ports=22 80 443 8080 8443' > "$FAKE_UCI"
 
 sh "$ROOT/root/usr/sbin/infra-port-watch" apply >/dev/null
-nft -c -f "$FAKE_NFT_DIR/checked"
+"$REAL_NFT" -c -f "$FAKE_NFT_DIR/checked"
 echo 'probe ruleset parses'
 
 printf '%s\n' \
@@ -66,5 +68,5 @@ sh "$ROOT/root/usr/sbin/infra-port-watch" apply >/dev/null
   printf '}\n'
 } > "$WORK/fw4.nft"
 
-nft -c -f "$WORK/fw4.nft"
+"$REAL_NFT" -c -f "$WORK/fw4.nft"
 echo 'verdict include parses'
