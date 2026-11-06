@@ -1,5 +1,18 @@
 # Changelog
 
+## v4.0.5 (2026-11-06)
+
+### Table layout
+
+- Destination IP addresses no longer wrap at the last octet. The theme rewrite
+  in 4.0.0 dropped the `nowrap` rules for the destination column, so
+  `overflow-wrap: break-word` split `5.103.97.94` into `5.103.97.9` and `4`.
+- Source addresses, ports and the timestamp are now atomic as well; those cells
+  use `overflow-wrap: normal`.
+- The mobile card layout no longer re-enables wrapping for the destination.
+- A regression test checks the rules, and the table was verified with a rendered
+  sample before release.
+
 ## v4.0.4 (2026-11-06)
 
 ### GeoIP parser

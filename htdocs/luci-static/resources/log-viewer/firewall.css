@@ -491,6 +491,25 @@
 	text-decoration: none;
 }
 
+
+/* Addresses and ports are atomic: a wrapped last octet looks like a typo. */
+.fw-shell .fw-table td:nth-child(3),
+.fw-shell .fw-table td:nth-child(3) code,
+.fw-shell .fw-table td:nth-child(3) code *,
+.fw-shell .fw-source code,
+.fw-shell .fw-source-link,
+.fw-shell .fw-port strong,
+.fw-shell .fw-port small,
+.fw-shell .fw-time {
+	white-space: nowrap;
+}
+
+.fw-shell .fw-table td:nth-child(3),
+.fw-shell .fw-source,
+.fw-shell .fw-port { overflow-wrap: normal; }
+
+.fw-shell .fw-table td:nth-child(3) code { display: inline-block; }
+
 /* ------------------------------------------------------------------ badges */
 
 .fw-badge {
@@ -1007,8 +1026,7 @@
 		text-transform: uppercase;
 	}
 	.fw-shell .fw-time,
-	.fw-shell .fw-source { min-width: 0; white-space: normal; }
-	.fw-shell .fw-table td:nth-child(3) { white-space: normal; }
+	.fw-shell .fw-source { min-width: 0; }
 	.fw-shell .fw-history-controls { grid-template-columns: 1fr; }
 	.fw-modal .fw-watch-grid { grid-template-columns: 1fr; gap: 0; }
 	.fw-drawer-modal { width: 100vw; }

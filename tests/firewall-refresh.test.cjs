@@ -161,6 +161,13 @@ test('the lookup wrapper falls back to mmdblookup when the helper is broken', ()
   assert.ok(wrapper.includes('if [ -n "$helper_out" ]'));
   assert.ok(wrapper.includes('for ip in "$@"; do'));
 });
+test('addresses and ports never wrap mid-value', () => {
+  assert.match(css, /\.fw-table td:nth-child\(3\),[\s\S]{0,300}white-space: nowrap/);
+  assert.match(css, /\.fw-source code,[\s\S]{0,300}white-space: nowrap/);
+  assert.match(css, /\.fw-port strong,[\s\S]{0,300}white-space: nowrap/);
+  assert.match(css, /\.fw-table td:nth-child\(3\),\n\.fw-shell \.fw-source,\n\.fw-shell \.fw-port \{ overflow-wrap: normal; \}/);
+  assert.doesNotMatch(css, /td:nth-child\(3\) \{ white-space: normal; \}/);
+});
 test('the page inherits the LuCI theme instead of shipping its own palette', () => {
   assert.match(source, /L\.resource\('log-viewer\/firewall\.css'\)/);
   assert.doesNotMatch(source, /--mp-bg/, 'the hard-coded palette must be gone');
