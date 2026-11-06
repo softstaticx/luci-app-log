@@ -34,7 +34,8 @@ test('GeoIP update is serialised and verifies what it downloads', () => {
 test('the page streams GeoIP answers as newline-delimited JSON', () => {
   assert.match(view, /flint4-geoip', \['--batch'\]/);
   assert.match(view, /text\.split\('\\n'\)/);
-  assert.match(view, /3\.x helper returned one JSON object/);
+  assert.match(view, /function parseGeoBatch/);
+  assert.match(view, /parseGeoBatch\(raw\)/);
 });
 
 test('the packaged helper is documented as falling back to the shell implementation', () => {

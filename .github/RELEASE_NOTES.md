@@ -1,46 +1,51 @@
-# luci-app-log v4.0.3
+# luci-app-log v4.0.4
 
 OpenWrt 25.12 patch release. The package name remains `luci-app-log-viewer`.
 
-## What this release is for
+## The bug
 
-4.0.2 made a broken lookup helper fall back to `mmdblookup` and added a GeoIP
-banner. 4.0.3 makes the remaining failures say what is wrong, instead of showing
-blank rows.
+If the page showed
 
-- `flint4-geoip --status` now checks the country database with a real lookup and
-  returns a `reason`: `no database`, `mmdblookup missing` or
-  `database unreadable`. A truncated `.mmdb` is no longer reported as ready.
-- Lookups without a database return an explicit error record, so the page shows
-  **GeoIP off · no database** (or the matching reason) and the banner explains
-  what to do.
-- The test suite covers missing, corrupt and unreadable database states.
+> GeoIP lookups are failing: Unexpected non-whitespace character after JSON at position 129 (line 2 column 1)
 
-## If GeoIP is still off
+then every GeoIP lookup was being thrown away by the browser, even with valid
+databases installed. The view tried to parse a whole newline-delimited batch as
+a single JSON document; the check that was meant to recognise the old 3.x format
+(`text.startsWith('{')`) matched every batch, and `JSON.parse` failed on the
+second line. The failure was caught, cached as "no data", and every row fell
+back to **GeoIP unavailable**.
 
-Run these on the router and compare:
+This affected 4.0.0–4.0.3. It only became visible once the databases existed,
+which is why the earlier fixes (updater, fallback, reasons) did not make the
+columns populate.
 
-```sh
-/usr/bin/flint4-geoip --status
-/usr/bin/flint4-geoip --batch 8.8.8.8
-ls -l /usr/share/GeoIP
-```
+## The fix
 
-| Output | Meaning | Fix |
-| --- | --- | --- |
-| `"available":false,"reason":"no database"` | No `.mmdb` files | Update the databases |
-| `"reason":"mmdblookup missing"` | `libmaxminddb` is not installed | `apk add libmaxminddb` |
-| `"reason":"database unreadable"` | A file is truncated or corrupt | Update the databases again |
-| `"available":true` but the batch line has `"error"` | The helper could not read the files | Update the databases; the wrapper falls back to `mmdblookup` |
-| Batch prints `country_code` | Lookups work; reload the page | — |
+- The batch is parsed one line at a time and accepts both shapes: the current
+  one-object-per-address output and the 3.x single object keyed by address.
+- Error records are preserved so the page can explain them.
+- Unit tests cover NDJSON, the 3.x payload, error records, garbage input, and an
+  explicit regression test for the whole-batch case.
 
-The last update message is always in `/tmp/log-viewer/geoip-update.status`.
-
-## Upgrading
+## Upgrading and verifying
 
 ```sh
 uclient-fetch -qO- https://raw.githubusercontent.com/softstaticx/luci-app-log/main/install-online.sh | sh
 ```
+
+Then **hard-refresh the page** (Ctrl+F5 / Cmd+Shift+R) so the browser drops the
+cached `firewall.js`.
+
+The GeoIP column should populate within a refresh, and the banner disappears.
+From a shell:
+
+```sh
+/usr/bin/flint4-geoip --batch 8.8.8.8
+```
+
+should print one JSON line with a `country_code`. If the page still shows
+GeoIP off, the status reason names the cause (`no database`,
+`mmdblookup missing`, `database unreadable`) — see v4.0.3 notes.
 
 No configuration changes. Settings, ports, WAN zone and history are preserved.
 

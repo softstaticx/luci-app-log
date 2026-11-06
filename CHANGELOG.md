@@ -1,5 +1,26 @@
 # Changelog
 
+## v4.0.4 (2026-11-06)
+
+### GeoIP parser
+
+The page fed a whole newline-delimited batch to `JSON.parse`. As soon as the
+databases were present and a batch contained more than one address, it threw
+
+```
+Unexpected non-whitespace character after JSON at position 129 (line 2 column 1)
+```
+
+every address was cached as a miss, and the table showed **GeoIP unavailable**
+on every row. Detection used `text.startsWith('{')`, which is true for every
+NDJSON line.
+
+- Parse the batch one line at a time and accept both shapes: the current
+  one-object-per-address output and the 3.x single object keyed by address.
+- Keep `error` records so the page can explain them.
+- New unit tests cover NDJSON, the 3.x payload, error records and garbage; the
+  "whole batch" case is an explicit regression test.
+
 ## v4.0.3 (2026-11-06)
 
 ### GeoIP diagnostics

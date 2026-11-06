@@ -3,7 +3,7 @@
 set -eu
 
 REPO=softstaticx/luci-app-log
-VERSION_FALLBACK=v4.0.3
+VERSION_FALLBACK=v4.0.4
 FAMILY=25.12
 EXT=apk
 TMP="/tmp/reffix-luci-install.$$"

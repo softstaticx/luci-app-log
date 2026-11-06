@@ -63,6 +63,34 @@ function writeGeoMemory(store, ip, record, now, maxEntries) {
   return next;
 }
 
+// flint4-geoip emits newline-delimited JSON (one object per address); the 3.x
+// helper returned a single object keyed by address. Parse either shape line by
+// line: feeding the whole batch to JSON.parse used to throw on every batch,
+// which made every lookup look like a miss.
+function parseGeoBatch(raw) {
+  const byIp = new Map();
+  const text = String(raw || '').trim();
+  if (!text) return byIp;
+  text.split('\n').forEach(line => {
+    line = line.trim();
+    if (!line) return;
+    let parsed;
+    try { parsed = JSON.parse(line); }
+    catch (e) { return; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    if (parsed.ip) {
+      byIp.set(String(parsed.ip), parsed);
+      return;
+    }
+    Object.keys(parsed).forEach(key => {
+      const value = parsed[key];
+      if (value && typeof value === 'object' && !Array.isArray(value))
+        byIp.set(key, Object.assign({ip: key}, value));
+    });
+  });
+  return byIp;
+}
+
 function watchConfigIsFresh(syncedAt, now, ttlMs) {
   const at = Number(syncedAt) || 0;
   return at > 0 && Number(now) - at < Number(ttlMs);
@@ -1723,22 +1751,7 @@ return view.extend({
       const chunk = chunks[i];
       try {
         const raw = await fs.exec_direct('/usr/bin/flint4-geoip', ['--batch'].concat(chunk), 'text');
-        const byIp = new Map();
-        const text = String(raw || '').trim();
-        if (text.startsWith('{')) {
-          // 3.x helper returned one JSON object keyed by address.
-          const object = JSON.parse(text);
-          Object.keys(object).forEach(ip => byIp.set(ip, object[ip]));
-        }
-        else {
-          text.split('\n').filter(Boolean).forEach(line => {
-            try {
-              const row = JSON.parse(line);
-              if (row && row.ip) byIp.set(String(row.ip), row);
-            }
-            catch (e) {}
-          });
-        }
+        const byIp = parseGeoBatch(raw);
         chunk.forEach(ip => {
           const row = byIp.get(ip);
           if (row && row.error) lookupError = String(row.error);
