@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/softstaticx/luci-app-log/releases/latest"><img alt="Release" src="https://img.shields.io/badge/release-v4.0.0-22d3ee?style=flat-square"></a>
+  <a href="https://github.com/softstaticx/luci-app-log/releases/latest"><img alt="Release" src="https://img.shields.io/badge/release-v4.0.1-22d3ee?style=flat-square"></a>
   <img alt="OpenWrt" src="https://img.shields.io/badge/OpenWrt-25.12-00b5e2?style=flat-square">
   <img alt="Package" src="https://img.shields.io/badge/package-apk-0ea5e9?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-34d399?style=flat-square">
@@ -91,9 +91,9 @@ databases. Then open **Status → Firewall Log** and log in again if the menu en
 Download from [Releases](https://github.com/softstaticx/luci-app-log/releases):
 
 ```sh
-wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.0/reffix-luci-app-log-viewer-openwrt-25.12.apk
-wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.0/reffix-libmaxminddb-openwrt-25.12.apk
-wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.0/SHA256SUMS-openwrt-25.12.txt
+wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.1/reffix-luci-app-log-viewer-openwrt-25.12.apk
+wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.1/reffix-libmaxminddb-openwrt-25.12.apk
+wget https://github.com/softstaticx/luci-app-log/releases/download/v4.0.1/SHA256SUMS-openwrt-25.12.txt
 sha256sum -c SHA256SUMS-openwrt-25.12.txt
 apk add --allow-untrusted ./reffix-libmaxminddb-openwrt-25.12.apk ./reffix-luci-app-log-viewer-openwrt-25.12.apk
 /usr/bin/flint4-geoip-update
@@ -193,7 +193,7 @@ Settings are normally changed in the page (Settings → WAN watch / History / Fi
 | No rows at all | Settings → WAN watch: is the mode `verdict` and the zone exactly the zone name in **Network → Firewall**? `nft list chain inet fw4 input_wan \| grep INFRA_PORT_BLOCK` |
 | "Enabled · rules not detected" | Press **Re-apply rules** in WAN watch settings; the firewall may have been flushed with `fw4 flush` |
 | Probe mode logs nothing | The WAN device must match `IN=`; try `auto` or the name shown by `logread -f` while connecting |
-| GeoIP column is empty | `flint4-geoip --status`; run `flint4-geoip-update`; make sure `mmdblookup` exists |
+| GeoIP column is empty | `flint4-geoip --status`; run `flint4-geoip-update`; make sure `mmdblookup` exists. The last updater message is in `/tmp/log-viewer/geoip-update.status` |
 | History does not grow | `log-viewer-history status`; the directory must be a mounted, writable path; internal flash is a bad target |
 | Everything was working before a firewall change | fw4 keeps the includes, but `fw4 flush`/`firewall stop` deletes all tables. Re-apply, or reboot |
 

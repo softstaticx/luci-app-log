@@ -1,0 +1,27 @@
+#!/bin/sh
+# uclient-fetch(1) stand-in for the shell test suite.
+#
+# Usage: uclient-fetch -q -O <dest> <url>. Copies a prepared file so the GeoIP
+# updater can be exercised without network access.
+set -eu
+
+dest=""
+url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -q) shift ;;
+    -O) dest="$2"; shift 2 ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+[ -n "$dest" ] || { echo 'uclient-fetch: missing -O' >&2; exit 2; }
+[ "${FAKE_FETCH_FAIL:-0}" = "1" ] && { echo 'uclient-fetch: simulated failure' >&2; exit 1; }
+
+case "$url" in
+  *GeoLite2-ASN.mmdb*) src="${FAKE_ASN_FILE:?FAKE_ASN_FILE must be set}" ;;
+  *GeoLite2-Country.mmdb*) src="${FAKE_COUNTRY_FILE:?FAKE_COUNTRY_FILE must be set}" ;;
+  *) echo "uclient-fetch: unexpected url $url" >&2; exit 1 ;;
+esac
+
+cp "$src" "$dest"

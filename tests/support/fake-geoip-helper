@@ -1,0 +1,13 @@
+#!/bin/sh
+# Native GeoIP helper stand-in: answers every address after --batch.
+set -eu
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --db) shift 2 ;;
+    --batch) shift; break ;;
+    *) shift ;;
+  esac
+done
+for ip in "$@"; do
+  printf '{"ip":"%s","country_code":"DE","country_name":"Germany","asn":"3320","asn_organization":"Example ASN"}\n' "$ip"
+done

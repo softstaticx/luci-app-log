@@ -42,7 +42,9 @@ if has "$CONFIG.main"; then
     uci set "$CONFIG.history=history"
     for option in enabled directory days max_mb; do
       value="$(uciq "$CONFIG.main.$option")"
-      [ -n "$value" ] && uci set "$CONFIG.history.$option=$value"
+      if [ -n "$value" ]; then
+        uci set "$CONFIG.history.$option=$value"
+      fi
     done
     echo "migrated history section main -> history"
   fi

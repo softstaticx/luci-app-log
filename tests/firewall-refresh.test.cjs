@@ -211,7 +211,10 @@ test('empty or malformed watch status is treated as unavailable', () => {
     enabled: true, wan_interface: 'auto', ports: '22'
   });
   assert.match(source, /const config = parseWatchConfig\(raw\);/);
-  assert.match(source, /this\.watchConfig = parseWatchConfig\(raw\);/);
+  assert.match(source, /const savedConfig = parseWatchConfig\(raw\);/);
+  assert.match(source, /if \(!savedConfig\) throw new Error/);
+  assert.match(source, /if \(!updated\) throw new Error/);
+  assert.match(source, /if \(!imported\) throw new Error/);
 
   const watchEnabled = extract('watchEnabled');
   assert.equal(watchEnabled(null), true);

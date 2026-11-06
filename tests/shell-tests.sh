@@ -329,7 +329,82 @@ check "status is valid JSON" json_ok "$G/data/status.json"
 check "status reports availability" has "$G/data/status.json" '"available":true'
 check "status exposes the database size" has "$G/data/status.json" '"country_bytes":4'
 
+# ------------------------------------------------------------ geoip update ---
+
+group "geoip: updater finishes on the shipped empty checksum defaults"
+new_env geoipupdate
+U="$env_dir"
+mkdir -p "$U/data/geodb" "$U/data/scratch"
+printf 'country-db' > "$U/data/country.mmdb"
+printf 'asn-db' > "$U/data/asn.mmdb"
+# The shipped configuration has empty sha256_country and sha256_asn values.
+uci_set log-viewer.geoip.directory "$U/data/geodb"
+uci_set log-viewer.geoip.url "https://example.invalid/geolite"
+uci_set log-viewer.geoip.sha256_country ""
+uci_set log-viewer.geoip.sha256_asn ""
+cp "$SUPPORT/fake-mmdblookup" "$env_dir/bin/mmdblookup"
+cp "$SUPPORT/fake-uclient-fetch" "$env_dir/bin/uclient-fetch"
+chmod +x "$env_dir/bin/mmdblookup" "$env_dir/bin/uclient-fetch"
+export FAKE_COUNTRY_FILE="$U/data/country.mmdb"
+export FAKE_ASN_FILE="$U/data/asn.mmdb"
+export GEOIP_DB_DIR="$U/data/geodb"
+export GEOIP_UPDATE_TMP="$U/data/scratch"
+export GEOIP_UPDATE_STATUS="$U/data/geo.status"
+export GEOIP_UPDATE_LOCK="$U/data/geo.lock"
+export FAKE_FETCH_FAIL=0
+UPDATER="$ROOT/root/usr/bin/flint4-geoip-update"
+
+sh "$UPDATER" > "$U/data/out" 2>&1
+check "updater exits 0 with empty checksum options" equals "$?" "0"
+check "updater writes a complete status" has "$U/data/geo.status" '"state":"complete"'
+check "updater applies the country database" file_exists "$U/data/geodb/GeoLite2-Country.mmdb"
+check "updater applies the ASN database" file_exists "$U/data/geodb/GeoLite2-ASN.mmdb"
+check "updater leaves no staging files" file_missing "$U/data/geodb/GeoLite2-Country.mmdb.new"
+check "update status is valid JSON" json_ok "$U/data/geo.status"
+
+sh "$ROOT/root/usr/bin/flint4-geoip" --status > "$U/data/lookup-status.json" 2>/dev/null
+check "lookup status is valid JSON" json_ok "$U/data/lookup-status.json"
+check "lookup sees the installed databases" has "$U/data/lookup-status.json" '"available":true'
+
+group "geoip: updater reports a failed download"
+export FAKE_FETCH_FAIL=1
+sh "$UPDATER" > "$U/data/fail.out" 2>&1
+check "failed download exits non-zero" equals "$?" "1"
+check "failed download records an error state" has "$U/data/geo.status" '"state":"error"'
+check "failed download explains itself" has "$U/data/geo.status" "Could not download"
+check "failed download keeps the previous database" equals "$(cat "$U/data/geodb/GeoLite2-Country.mmdb")" "country-db"
+check "failed download prints the reason" has "$U/data/fail.out" "Could not download"
+export FAKE_FETCH_FAIL=0
+
+group "geoip: a checksum pin mismatch aborts before replacing anything"
+export GEOIP_SHA256_COUNTRY="0000000000000000000000000000000000000000000000000000000000000000"
+sh "$UPDATER" > "$U/data/sha.out" 2>&1
+check "checksum mismatch exits non-zero" equals "$?" "1"
+check "checksum mismatch records an error" has "$U/data/geo.status" 'checksum mismatch'
+check "checksum mismatch keeps the previous database" equals "$(cat "$U/data/geodb/GeoLite2-Country.mmdb")" "country-db"
+unset GEOIP_SHA256_COUNTRY
+
+group "geoip: lookup works when the geoip UCI section is missing"
+new_env geipnouci
+L="$env_dir"
+mkdir -p "$L/data/db"
+printf 'x' > "$L/data/db/GeoLite2-Country.mmdb"
+printf 'y' > "$L/data/db/GeoLite2-ASN.mmdb"
+cp "$SUPPORT/fake-mmdblookup" "$env_dir/bin/mmdblookup"
+cp "$SUPPORT/fake-geoip-helper" "$env_dir/bin/log-viewer-geoip"
+chmod +x "$env_dir/bin/mmdblookup" "$env_dir/bin/log-viewer-geoip"
+# PATH still has the fake uci, but the database has no log-viewer.geoip keys,
+# which is what a half-migrated router looks like. The native helper keeps the
+# test independent of the default database path.
+unset GEOIP_DB_DIR
+export LOG_VIEWER_GEOIP_HELPER="$env_dir/bin/log-viewer-geoip"
+sh "$ROOT/root/usr/bin/flint4-geoip" --batch 1.2.3.4 > "$L/data/out.ndjson" 2>"$L/data/err"
+check "lookup survives an empty geoip section" equals "$?" "0"
+check "lookup still answers the address" has "$L/data/out.ndjson" '"country_code":"DE"'
+check "lookup prints one line" equals "$(wc -l < "$L/data/out.ndjson" | tr -d ' ')" "1"
+
 # -------------------------------------------------------------- migration ---
+
 
 group "upgrade: 3.x configuration migrates without losing settings"
 new_env migrate

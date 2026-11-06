@@ -901,7 +901,9 @@ return view.extend({
                 watcher.mode || 'verdict', watcher.wan_zone || 'wan', watcher.wan_interface,
                 watcher.ipv6 === 0 || watcher.ipv6 === '0' || watcher.ipv6 === false ? '0' : '1',
                 watcher.log_other_ports ? '1' : '0', watcher.ports], 'text');
-              this.watchConfig = parseWatchConfig(raw);
+              const imported = parseWatchConfig(raw);
+              if (!imported) throw new Error(_('The router did not confirm the imported settings.'));
+              this.watchConfig = imported;
               this.watchConfigLoaded = true;
               this.watchConfigSyncedAt = Date.now();
             }
@@ -1016,7 +1018,9 @@ return view.extend({
         const raw = await fs.exec_direct('/usr/sbin/log-viewer-history', [
           'configure', enabled.checked ? '1' : '0', directory.value.trim(), days.value, maxMb.value, ring.value
         ], 'text');
-        this.routerHistoryStatus = parseWatchConfig(raw);
+        const savedHistory = parseWatchConfig(raw);
+        if (!savedHistory) throw new Error(_('The router did not confirm the history settings.'));
+        this.routerHistoryStatus = savedHistory;
         this.routerHistorySyncedAt = Date.now();
         if (this.routerHistoryText && this.routerHistoryStatus) {
           const count = this.routerHistoryStatus.count != null ? this.routerHistoryStatus.count : '—';
@@ -1260,9 +1264,11 @@ return view.extend({
     const repair = E('button', {class: 'cbi-button', type: 'button', click: async () => {
       repair.disabled = true;
       try {
-        await fs.exec_direct('/usr/sbin/infra-port-watch', ['apply'], 'text');
+        const output = await fs.exec_direct('/usr/sbin/infra-port-watch', ['apply'], 'text', false, true);
         await this.loadWatchConfig(true);
         this.renderWatchStatus();
+        if (!watchInstalled(this.watchConfig))
+          throw new Error(String(output || '').trim() || _('The firewall did not load the new rules.'));
         ui.addNotification(null, E('p', _('Watch rules re-applied.')), 'info');
       }
       catch (e) { ui.addNotification(null, E('p', _('Could not re-apply the rules: ') + (e.message || e)), 'error'); }
@@ -1315,7 +1321,9 @@ return view.extend({
           'set', watching.checked ? '1' : '0', mode.value, wanZone, wan,
           ipv6.checked ? '1' : '0', otherSample.checked ? '1' : '0', watchPorts.value
         ], 'text');
-        this.watchConfig = parseWatchConfig(raw);
+        const savedConfig = parseWatchConfig(raw);
+        if (!savedConfig) throw new Error(_('The router did not confirm the new settings.'));
+        this.watchConfig = savedConfig;
         this.watchConfigLoaded = true;
         this.watchConfigSyncedAt = Date.now();
       }
@@ -1430,7 +1438,9 @@ return view.extend({
         'set', enabled, config.mode || 'verdict', config.wan_zone || 'wan',
         config.wan_interface || 'auto', config.ipv6 === 0 || config.ipv6 === '0' ? '0' : '1', other, next.ports
       ], 'text');
-      this.watchConfig = parseWatchConfig(raw);
+      const updated = parseWatchConfig(raw);
+      if (!updated) throw new Error(_('The router did not confirm the port change.'));
+      this.watchConfig = updated;
       this.watchConfigLoaded = true;
       this.watchConfigSyncedAt = Date.now();
     }
@@ -1449,28 +1459,29 @@ return view.extend({
     const stateLine = E('p', {class: 'fw-geo-state'}, _('Starting GeoIP update…'));
     const detail = E('pre', {class: 'fw-raw-log fw-geo-log'}, '');
     const error = E('p', {class: 'fw-modal-error', hidden: true, role: 'alert'});
+    let poll = null;
+    let finished = false;
+    let output = '';
     const close = E('button', {class: 'cbi-button', type: 'button', click: () => {
       if (poll) clearInterval(poll);
       ui.hideModal();
     }}, _('Close'));
-    let poll = null;
+    const readStatus = async () => {
+      try { return parseWatchConfig(await fs.read('/tmp/log-viewer/geoip-update.status')); }
+      catch (e) { return null; }
+    };
     const updateStatus = async () => {
-      try {
-        const raw = await fs.read('/tmp/log-viewer/geoip-update.status');
-        const status = parseWatchConfig(raw);
-        if (!status) return;
-        stateLine.textContent = status.message || status.state || '';
-        const sizes = [];
-        if (status.country_bytes) sizes.push(_('Country ') + formatBytes(status.country_bytes));
-        if (status.asn_bytes) sizes.push(_('ASN ') + formatBytes(status.asn_bytes));
-        if (sizes.length) detail.textContent = sizes.join(' · ');
-        if (status.state === 'complete' || status.state === 'done' || status.state === 'error') {
-          clearInterval(poll);
-          poll = null;
-          close.disabled = false;
-        }
+      const status = await readStatus();
+      if (!status || finished) return;
+      stateLine.textContent = status.message || status.state || '';
+      const sizes = [];
+      if (status.country_bytes) sizes.push(_('Country ') + formatBytes(status.country_bytes));
+      if (status.asn_bytes) sizes.push(_('ASN ') + formatBytes(status.asn_bytes));
+      if (sizes.length) detail.textContent = sizes.join(' · ');
+      if (status.state === 'complete' || status.state === 'done' || status.state === 'error') {
+        if (poll) { clearInterval(poll); poll = null; }
+        close.disabled = false;
       }
-      catch (e) {}
     };
     ui.showModal(_('Update GeoIP databases'), [
       E('p', {class: 'cbi-section-descr'}, _('Downloads the GeoLite2 Country and ASN databases from GitHub, validates both with mmdblookup, then replaces the local copies. This can take a minute on a slow link.')),
@@ -1482,16 +1493,33 @@ return view.extend({
     await updateStatus();
     poll = setInterval(updateStatus, 1000);
     try {
-      const output = await fs.exec_direct('/usr/bin/flint4-geoip-update', [], 'text', false, true);
+      // cgi-io always answers 200 for cgi-exec, so the exit status is not
+      // visible here. The status file written by the updater is the source of
+      // truth; never claim success from the promise alone.
+      output = await fs.exec_direct('/usr/bin/flint4-geoip-update', [], 'text', false, true);
+      const status = await readStatus();
+      if (status && status.state === 'error')
+        throw new Error(status.message || _('The updater reported an error.'));
+      if (!status || (status.state !== 'complete' && status.state !== 'done'))
+        throw new Error((status && status.message) || _('The update did not complete.'));
       await this.loadGeoStatus();
       this.renderGeoStatus();
+      if (!this.geoStatus || !this.geoStatus.available)
+        throw new Error(_('The update finished, but the databases are still unavailable.'));
+      finished = true;
+      const sizes = [];
+      if (status.country_bytes) sizes.push(_('Country ') + formatBytes(status.country_bytes));
+      if (status.asn_bytes) sizes.push(_('ASN ') + formatBytes(status.asn_bytes));
       stateLine.textContent = _('Applied. Databases are ready.');
-      detail.textContent = String(output || '').trim() || detail.textContent;
+      detail.textContent = sizes.join(' · ') || String(output || '').trim();
     }
     catch (e) {
+      finished = true;
+      const status = await readStatus();
       error.textContent = _('GeoIP databases were not updated: ') + (e.message || e);
       error.hidden = false;
-      await updateStatus();
+      stateLine.textContent = (status && status.message) || _('Update failed.');
+      if (String(output || '').trim()) detail.textContent = String(output).trim();
       try { await this.loadGeoStatus(); this.renderGeoStatus(); }
       catch (statusError) {}
     }
@@ -1501,7 +1529,6 @@ return view.extend({
       if (this.geoUpdateButton) this.geoUpdateButton.disabled = false;
     }
   },
-
   getTimeWindowMs: function() {
     return ({
       '5m': 5 * 60 * 1000,
@@ -1747,7 +1774,9 @@ return view.extend({
 
   clearRouterHistoryNow: async function() {
     const raw = await fs.exec_direct('/usr/sbin/log-viewer-history', ['clear'], 'text');
-    this.routerHistoryStatus = parseWatchConfig(raw);
+    const cleared = parseWatchConfig(raw);
+    if (!cleared) throw new Error(_('The router did not confirm that history was cleared.'));
+    this.routerHistoryStatus = cleared;
     this.routerHistorySyncedAt = Date.now();
     this.lastRingData = null;
     if (this.routerHistoryText)

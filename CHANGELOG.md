@@ -1,5 +1,36 @@
 # Changelog
 
+## v4.0.1 (2026-11-06)
+
+GeoIP updates were broken on a default 4.0.0 install. Two shell bugs made the
+updater exit before it printed anything, and the page then reported success
+because cgi-io answers 200 even for a failed command.
+
+### Fixed
+
+- **GeoIP updater aborted silently.** `load_uci()` ended with
+  `[ -n "$v" ] && VAR="$v"`. With the shipped empty `sha256_country` and
+  `sha256_asn` options the function returned 1, and `set -e` exited the script.
+  Every branch is now an explicit `if`, and the function returns 0.
+- **Stderr was swallowed.** `exec 9>"$LOCK" 2>/dev/null` applies its
+  redirections to the whole shell, so the updater (and the history collector)
+  lost every error message. The lock no longer redirects stderr.
+- **The page claimed success for failed writes.** cgi-io always returns
+  `200 OK` for cgi-exec, so the promise resolving means nothing. Settings
+  saves, history changes, clearing history, re-applying rules and GeoIP updates
+  now verify the JSON/status the script produced and surface the failure.
+- **The installer hid the reason.** It now prints the updater's own output and
+  the status file when a GeoIP refresh fails.
+- `flint4-geoip` had the same `set -e` pattern when the `geoip` UCI section was
+  missing; it now works on a half-migrated configuration.
+- The 3.x history-section migration used the same pattern for empty options.
+
+### Tests
+
+- The GeoIP updater is now executed by the shell suite: empty checksum
+  defaults, a failed download, a checksum-pin mismatch, and a lookup on a
+  router without a `geoip` section. These tests fail on 4.0.0.
+
 ## v4.0.0 (2026-11-06)
 
 The "confirmed verdicts" release. The watcher moved from iptables to native

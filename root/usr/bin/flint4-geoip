@@ -9,9 +9,11 @@ set -eu
 
 DB_DIR="${GEOIP_DB_DIR:-/usr/share/GeoIP}"
 HELPER="${LOG_VIEWER_GEOIP_HELPER:-/usr/libexec/log-viewer-geoip}"
+# Explicit `if` on purpose: a trailing `[ -n "$v" ] && DB_DIR="$v"` would make
+# this script return 1 when the option is absent, and `set -e` would exit.
 if [ -z "${GEOIP_DB_DIR:-}" ] && command -v uci >/dev/null 2>&1; then
   v="$(uci -q get log-viewer.geoip.directory 2>/dev/null || true)"
-  [ -n "$v" ] && DB_DIR="$v"
+  if [ -n "$v" ]; then DB_DIR="$v"; fi
 fi
 country_db="$DB_DIR/GeoLite2-Country.mmdb"
 asn_db="$DB_DIR/GeoLite2-ASN.mmdb"

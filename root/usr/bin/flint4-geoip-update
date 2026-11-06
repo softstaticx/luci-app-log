@@ -21,12 +21,30 @@ uci_get() { uci -q get "$1" 2>/dev/null || true; }
 
 # UCI provides the persistent defaults; an environment variable still wins so
 # the test suite and one-off runs can point somewhere else.
+#
+# Every branch is an explicit `if`: a trailing `[ -n "$v" ] && VAR="$v"` makes
+# the function return 1 when the option is empty, and `set -e` then exits the
+# whole updater without printing anything. That is exactly what happened with
+# the shipped empty `sha256_*` defaults in 4.0.0.
 load_uci() {
   command -v uci >/dev/null 2>&1 || return 0
-  [ -n "${GEOIP_DB_DIR:-}" ] || { v="$(uci_get log-viewer.geoip.directory)"; [ -n "$v" ] && BASE="$v"; }
-  [ -n "${GEOIP_URL:-}" ] || { v="$(uci_get log-viewer.geoip.url)"; [ -n "$v" ] && URL="$v"; }
-  [ -n "${GEOIP_SHA256_COUNTRY:-}" ] || { v="$(uci_get log-viewer.geoip.sha256_country)"; [ -n "$v" ] && SHA_COUNTRY="$v"; }
-  [ -n "${GEOIP_SHA256_ASN:-}" ] || { v="$(uci_get log-viewer.geoip.sha256_asn)"; [ -n "$v" ] && SHA_ASN="$v"; }
+  if [ -z "${GEOIP_DB_DIR:-}" ]; then
+    v="$(uci_get log-viewer.geoip.directory)"
+    if [ -n "$v" ]; then BASE="$v"; fi
+  fi
+  if [ -z "${GEOIP_URL:-}" ]; then
+    v="$(uci_get log-viewer.geoip.url)"
+    if [ -n "$v" ]; then URL="$v"; fi
+  fi
+  if [ -z "${GEOIP_SHA256_COUNTRY:-}" ]; then
+    v="$(uci_get log-viewer.geoip.sha256_country)"
+    if [ -n "$v" ]; then SHA_COUNTRY="$v"; fi
+  fi
+  if [ -z "${GEOIP_SHA256_ASN:-}" ]; then
+    v="$(uci_get log-viewer.geoip.sha256_asn)"
+    if [ -n "$v" ]; then SHA_ASN="$v"; fi
+  fi
+  return 0
 }
 load_uci
 
@@ -73,7 +91,11 @@ require_space() {
 
 lock_take() {
   mkdir -p "$(dirname "$LOCK")" 2>/dev/null || true
-  exec 9>"$LOCK" 2>/dev/null || return 0
+  # No `2>/dev/null` on the exec: a redirection-only exec applies its
+  # redirections to the whole shell, which would silence the script forever.
+  if ! exec 9>"$LOCK"; then
+    return 0
+  fi
   command -v flock >/dev/null 2>&1 || return 0
   flock -n 9 2>/dev/null || return 1
 }

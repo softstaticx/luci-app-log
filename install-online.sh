@@ -3,7 +3,7 @@
 set -eu
 
 REPO=softstaticx/luci-app-log
-VERSION_FALLBACK=v4.0.0
+VERSION_FALLBACK=v4.0.1
 FAMILY=25.12
 EXT=apk
 TMP="/tmp/reffix-luci-install.$$"
@@ -231,10 +231,15 @@ install_downloaded_packages \
 
 if [ -x /usr/bin/flint4-geoip-update ]; then
   echo "Downloading local GeoLite2 country and ASN databases..."
-  if /usr/bin/flint4-geoip-update; then
+  # cgi-io is not involved here, but the updater can still fail quietly if it
+  # is interrupted; keep its own words in the log.
+  if geoip_output="$(/usr/bin/flint4-geoip-update 2>&1)"; then
+    [ -n "$geoip_output" ] && printf '%s\n' "$geoip_output"
     echo "GeoIP databases are ready."
   else
     echo "WARNING: GeoIP download failed; the app is installed, but local country/ASN enrichment is unavailable until updated." >&2
+    [ -n "$geoip_output" ] && printf '%s\n' "$geoip_output" >&2
+    /usr/bin/flint4-geoip-update --status >&2 2>/dev/null || true
   fi
 fi
 
