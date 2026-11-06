@@ -18,7 +18,7 @@ jobs:
         run: node --check htdocs/luci-static/resources/view/log-viewer/firewall.js
 
       - name: Unit tests
-        run: node --test tests/
+        run: node --test tests/*.test.cjs
 
       - name: Shell integration tests
         run: sh tests/shell-tests.sh
